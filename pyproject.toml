@@ -1,0 +1,11 @@
+[project]
+name = "transformer-megakernel"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "modal>=1.4.3",
+    "nvidia-cutlass-dsl[cu13]>=4.5.2",
+    "torch>=2.12.0",
+]

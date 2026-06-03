@@ -1,0 +1,234 @@
+import cutlass
+import cutlass.cute as cute
+from cutlass.cute.nvgpu import cpasync
+from cutlass import BFloat16, Float32
+from dataclasses import dataclass
+
+from operators.kernel_utils import (
+    ld_acquire_u32, atomic_add_release,
+    fence_proxy_async_shared_cta, fence_proxy_async_global, WarpgroupMeta,
+)
+
+
+@dataclass
+class RMSNormConfig:
+    embed_dim: int
+    num_stages: int
+    num_stages_rms: int
+    bR: int
+    rows_per_rms_block: int
+    bM: int
+    stage_elems: int
+
+    def __post_init__(self):
+        assert self.bM % self.rows_per_rms_block == 0
+        assert self.rows_per_rms_block % self.bR == 0
+        assert self.num_stages_rms >= 2
+        assert self.num_stages_rms == self.num_stages, "rms shares the matmul stage cursor"
+        assert self.embed_dim % 32 == 0
+        assert self.bR == 4, "bR must be 4 (one row per warp in a 4-warp WG)"
+
+
+class RMSNorm:
+    def __init__(self, config: RMSNormConfig,
+                 gEmb_rows: cute.Tensor, gWS1_rows: cute.Tensor, gRMS_w: cute.Tensor,
+                 tma_w: cute.CopyAtom, tma_in: cute.CopyAtom, tma_out: cute.CopyAtom):
+        self.config    = config
+        self.gEmb_rows = gEmb_rows
+        self.gWS1_rows = gWS1_rows
+        self.gRMS_w    = gRMS_w
+        self.tma_w     = tma_w
+        self.tma_in    = tma_in
+        self.tma_out   = tma_out
+
+    @cute.jit
+    def run(self, rms_w_idx, pid_m,
+            mAtomics, expected_cnt, atomic_idx, next_idx, storage, weight_reuse,
+            warpgroup: WarpgroupMeta, compute_mbar_phase, input_mbar_phase, output_bar_phase):
+
+        cfg        = self.config
+        E          = cfg.embed_dim
+        nS         = cfg.num_stages_rms
+        bR         = cfg.bR
+        chunks     = cfg.rows_per_rms_block // cfg.bR
+        n_per_thr  = E // 32
+        SE         = cfg.stage_elems
+
+        group_id   = warpgroup.group_id
+        local_warp = warpgroup.warp_id
+        group_tid  = warpgroup.group_tidx
+
+        self.sW = cute.make_tensor(storage.sW.data_ptr(), cute.make_layout((E,)))
+        self.sX = cute.make_tensor(
+            storage.stages.data_ptr(),
+            cute.make_layout((bR, E, nS), stride=(E, 1, SE)),
+        )
+        self.sO = storage.out.get_tensor(
+            cute.make_layout((bR, E, nS), stride=(E, 1, bR * E))
+        )
+
+        self.load_bar = storage.barriers.load_barrier.data_ptr()
+        load_stage = storage.barriers.stage.get_tensor(cute.make_layout((1,)))
+        phase_cell = storage.barriers.phase.get_tensor(cute.make_layout((1,)))
+
+        other = group_id ^ 1
+        self.input_bar_me   = storage.barriers.input_barrier.data_ptr()   + group_id
+        self.input_bar_ot   = storage.barriers.input_barrier.data_ptr()   + other
+        self.compute_bar_me = storage.barriers.compute_barrier.data_ptr() + group_id
+        self.compute_bar_ot = storage.barriers.compute_barrier.data_ptr() + other
+        self.output_bar_me  = storage.barriers.output_barrier.data_ptr()  + group_id
+        self.output_bar_ot  = storage.barriers.output_barrier.data_ptr()  + other
+
+        gE_chunks = cute.local_tile(self.gEmb_rows, (bR, E), (None, 0))
+        gO_chunks = cute.local_tile(self.gWS1_rows, (bR, E), (None, 0))
+        sX_g = cute.group_modes(self.sX, 0, 2)
+        sO_g = cute.group_modes(self.sO, 0, 2)
+        gE_g = cute.group_modes(gE_chunks, 0, 2)
+        gO_g = cute.group_modes(gO_chunks, 0, 2)
+        tEsX, tEgE = cpasync.tma_partition(self.tma_in,  0, cute.make_layout(1), sX_g, gE_g)
+        tOsO, tOgO = cpasync.tma_partition(self.tma_out, 0, cute.make_layout(1), sO_g, gO_g)
+
+        atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), BFloat16, num_bits_per_copy=128)
+        thr_layout = cute.make_layout((bR, 32), stride=(32, 1))
+        val_layout = cute.make_layout((1, n_per_thr), stride=(0, 1))
+        tc  = cute.make_tiled_copy_tv(atom, thr_layout, val_layout)
+        thr = tc.get_slice(group_tid)
+        off_m = pid_m * chunks
+
+        @cute.jit
+        def load_activations_async(stage, idx):
+            if local_warp == 0:
+                with cute.arch.elect_one():
+                    cute.arch.mbarrier_arrive_and_expect_tx(self.load_bar + stage, bR * E * 2)
+                cute.copy(self.tma_in, tEgE[None, off_m + idx], tEsX[None, stage],
+                          tma_bar_ptr=self.load_bar + stage)
+
+        @cute.jit
+        def warpgroup_sync():
+            cute.arch.barrier(barrier_id=10 + group_id, number_of_threads=128)
+
+        @cute.jit
+        def wait_for_prev_activations_sync():
+            if local_warp == 0:
+                with cute.arch.elect_one():
+                    ready = cutlass.Int32(0)
+                    while ready != expected_cnt:
+                        ready = ld_acquire_u32((mAtomics.iterator + atomic_idx).toint())
+            warpgroup_sync()
+
+        @cute.jit
+        def load_regs(stage):
+            tXsX = thr.partition_S(self.sX[None, None, stage])
+            rX   = cute.make_fragment_like(tXsX)
+            cute.autovec_copy(tXsX, rX)
+            return rX
+
+        @cute.jit
+        def store_outputs_async(stage, idx):
+            warpgroup_sync()
+            fence_proxy_async_shared_cta()
+            if local_warp == 0:
+                cute.copy(self.tma_out, tOsO[None, stage], tOgO[None, off_m + idx])
+                cute.arch.cp_async_bulk_commit_group()
+                cute.arch.cp_async_bulk_wait_group(nS - 2)
+
+        @cute.jit
+        def signal_next_activation():
+            if local_warp == 0:
+                cute.arch.cp_async_bulk_wait_group(0)
+                with cute.arch.elect_one():
+                    atomic_add_release((mAtomics.iterator + next_idx).toint(), cutlass.Int32(1))
+
+        @cute.jit
+        def compute_and_store(stage, rX, is_last=False):
+            xv = rX.load().to(Float32)
+            xv_sq = xv * xv
+            ssq_per_thr = xv_sq.reduce(cute.ReductionOp.ADD, init_val=Float32(0.0), reduction_profile=0)
+            ssq = cute.arch.warp_reduction_sum(ssq_per_thr)
+            mean_sq = ssq / Float32(E)
+            mean_sq_eps = mean_sq + Float32(1e-6)
+            scale = cute.math.rsqrt(mean_sq_eps, fastmath=True)
+            yv = xv * wv * scale
+            tXsO = thr.partition_S(self.sO[None, None, stage])
+            rY = cute.make_fragment_like(tXsO)
+            rY.store(yv.to(BFloat16))
+            if is_last:
+                cute.arch.mbarrier_arrive(self.compute_bar_ot)
+            cute.autovec_copy(rY, tXsO)
+
+        cute.arch.mbarrier_wait(self.input_bar_me, input_mbar_phase)
+        input_mbar_phase ^= cutlass.Int32(1)
+
+        stage      = load_stage[0]
+        load_phase = phase_cell[0]
+
+        @cute.jit
+        def wait_for_load_sync(stage):
+            nonlocal load_phase
+            cute.arch.mbarrier_wait(self.load_bar + stage, (load_phase >> stage) & 1)
+            load_phase ^= (cutlass.Int32(1) << stage)
+
+        if weight_reuse == 0 and local_warp == 0:
+            gW_tile = cute.local_tile(self.gRMS_w, (1, E), (rms_w_idx, 0))
+            sW_g = cute.group_modes(self.sW, 0, cute.rank(self.sW.layout))
+            gW_g = cute.group_modes(gW_tile, 0, cute.rank(gW_tile.layout))
+            sW_part, gW_part = cpasync.tma_partition(self.tma_w, 0, cute.make_layout(1), sW_g, gW_g)
+            with cute.arch.elect_one():
+                cute.arch.mbarrier_expect_tx(self.load_bar + stage, E * 2)
+            cute.copy(self.tma_w, gW_part, sW_part, tma_bar_ptr=self.load_bar + stage)
+
+        wait_for_prev_activations_sync()
+
+        prev_stage = stage
+        for s in cutlass.range_constexpr(nS - 1):
+            load_activations_async(stage, s)
+            stage = (stage + 1) % nS
+
+        wait_for_load_sync(prev_stage)
+
+        sW_bcast = cute.make_tensor(self.sW.iterator, cute.make_layout((bR, E), stride=(0, 1)))
+        tWsW = thr.partition_S(sW_bcast)
+        rW   = cute.make_fragment_like(tWsW)
+        cute.autovec_copy(tWsW, rW)
+        wv = rW.load().to(Float32)
+
+        cute.arch.mbarrier_wait(self.compute_bar_me, compute_mbar_phase)
+        compute_mbar_phase ^= cutlass.Int32(1)
+        load_activations_async(stage, nS - 1)
+        stage = (stage + 1) % nS
+        rX = load_regs(prev_stage)
+        cute.arch.mbarrier_wait(self.output_bar_me, output_bar_phase)
+        compute_and_store(prev_stage, rX)
+        store_outputs_async(prev_stage, 0)
+        prev_stage = (prev_stage + 1) % nS
+
+        for it in cutlass.range_constexpr(1, chunks - (nS - 1)):
+            load_activations_async(stage, it + nS - 1)
+            wait_for_load_sync(prev_stage)
+            rX = load_regs(prev_stage)
+            compute_and_store(prev_stage, rX)
+            store_outputs_async(prev_stage, it)
+            stage = (stage + 1) % nS
+            prev_stage = (prev_stage + 1) % nS
+
+        wait_for_load_sync(prev_stage)
+        rX = load_regs(prev_stage)
+        in_flight = (prev_stage + 1) % nS
+        if local_warp == 1:
+            with cute.arch.elect_one():
+                load_stage[0] = (prev_stage + nS - 1) % nS
+                phase_cell[0] = load_phase ^ (1 << in_flight)
+        cute.arch.mbarrier_arrive(self.input_bar_ot)
+        compute_and_store(prev_stage, rX)
+        store_outputs_async(prev_stage, chunks - 2)
+        prev_stage = in_flight
+        wait_for_load_sync(prev_stage)
+        rX = load_regs(prev_stage)
+        compute_and_store(prev_stage, rX, is_last=True)
+        store_outputs_async(prev_stage, chunks - 1)
+        if local_warp == 0:
+            cute.arch.cp_async_bulk_wait_group(0)
+            fence_proxy_async_global()
+
+        cute.arch.mbarrier_arrive(self.output_bar_ot)
+        signal_next_activation()

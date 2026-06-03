@@ -1,0 +1,71 @@
+"""
+Epilogue callables passed into Matmul.run().
+
+Each only stages the result into sC as bf16 and syncs the warpgroup — the
+matmul body owns the TMA-store to gC and the next_idx bump. thr_mma is the
+already-sliced MMA thread partition from the mainloop; barrier id is per
+warpgroup (8 + group_id). gC is the single 3D TMA view (M, N/bN, bN); reads
+take it with a bN box and squeeze, the store takes it with bN+PAD.
+
+    * basic_store        - acc                      (QKV, UP)
+    * residual_add_store - acc + gC                 (OUT, DOWN)
+    * silu_mul           - SiLU(acc) * gC            (GATE)
+"""
+
+import cutlass
+import cutlass.cute as cute
+
+from operators.kernel_utils import fence_proxy_async_shared_cta
+
+
+@cute.jit
+def basic_store(*, thr_mma, tCrC, sC, warpgroup, **_):
+    tCsC = thr_mma.partition_C(sC)
+    tCrD = cute.make_fragment_like(tCrC, cutlass.BFloat16)
+    tCrD.store(tCrC.load().to(cutlass.BFloat16))
+    cute.autovec_copy(tCrD, tCsC)
+    cute.arch.barrier(barrier_id=8 + warpgroup.group_id, number_of_threads=128)
+    fence_proxy_async_shared_cta()
+
+
+@cute.jit
+def residual_add_store(*, thr_mma, tCrC, sC, warpgroup,
+                       gC, pid_m, pid_n, bM, bN, use_tma_reduce, **_):
+    tCsC = thr_mma.partition_C(sC)
+    if cutlass.const_expr(use_tma_reduce):
+        tCrD = cute.make_fragment_like(tCrC, cutlass.BFloat16)
+        tCrD.store(tCrC.load().to(cutlass.BFloat16))
+        cute.autovec_copy(tCrD, tCsC)
+    else:
+        gC_tile = cute.local_tile(gC, (bM, 1, bN), (pid_m, pid_n, 0))[None, 0, None]
+        tCgC    = thr_mma.partition_C(gC_tile)
+        rR = cute.make_fragment_like(tCrC, cutlass.BFloat16)
+        cute.autovec_copy(tCgC, rR)
+        sum_f32 = tCrC.load() + rR.load().to(cutlass.Float32)
+        tCrD    = cute.make_fragment_like(tCrC, cutlass.BFloat16)
+        tCrD.store(sum_f32.to(cutlass.BFloat16))
+        cute.autovec_copy(tCrD, tCsC)
+    cute.arch.barrier(barrier_id=8 + warpgroup.group_id, number_of_threads=128)
+    fence_proxy_async_shared_cta()
+
+
+@cute.jit
+def silu_mul(*, thr_mma, tCrC, sC, warpgroup,
+             gC, pid_m, pid_n, bM, bN, **_):
+    tCsC    = thr_mma.partition_C(sC)
+    gC_tile = cute.local_tile(gC, (bM, 1, bN), (pid_m, pid_n, 0))[None, 0, None]
+    tCgC    = thr_mma.partition_C(gC_tile)
+
+    gate = tCrC.load()
+    silu = gate * (cutlass.Float32(1.0) /
+                   (cutlass.Float32(1.0) + cute.math.exp(-gate, fastmath=True)))
+
+    rUp = cute.make_fragment_like(tCrC, cutlass.BFloat16)
+    cute.autovec_copy(tCgC, rUp)
+    prod_f32 = silu * rUp.load().to(cutlass.Float32)
+    tCrD     = cute.make_fragment_like(tCrC, cutlass.BFloat16)
+    tCrD.store(prod_f32.to(cutlass.BFloat16))
+    cute.autovec_copy(tCrD, tCsC)
+
+    cute.arch.barrier(barrier_id=8 + warpgroup.group_id, number_of_threads=128)
+    fence_proxy_async_shared_cta()
