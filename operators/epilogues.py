@@ -30,14 +30,14 @@ def basic_store(*, thr_mma, tCrC, sC, warpgroup, **_):
 
 @cute.jit
 def residual_add_store(*, thr_mma, tCrC, sC, warpgroup,
-                       gC, pid_m, pid_n, bM, bN, use_tma_reduce, **_):
+                       gC, gC_tma=None, pid_m, pid_n, bM, bN, use_tma_reduce, **_):
     tCsC = thr_mma.partition_C(sC)
     if cutlass.const_expr(use_tma_reduce):
         tCrD = cute.make_fragment_like(tCrC, cutlass.BFloat16)
         tCrD.store(tCrC.load().to(cutlass.BFloat16))
         cute.autovec_copy(tCrD, tCsC)
     else:
-        gC_tile = cute.local_tile(gC, (bM, 1, bN), (pid_m, pid_n, 0))[None, 0, None]
+        gC_tile = cute.local_tile(gC, (bM, bN), (pid_m, pid_n))
         tCgC    = thr_mma.partition_C(gC_tile)
         rR = cute.make_fragment_like(tCrC, cutlass.BFloat16)
         cute.autovec_copy(tCgC, rR)
@@ -51,9 +51,9 @@ def residual_add_store(*, thr_mma, tCrC, sC, warpgroup,
 
 @cute.jit
 def silu_mul(*, thr_mma, tCrC, sC, warpgroup,
-             gC, pid_m, pid_n, bM, bN, **_):
+             gC, gC_tma=None, pid_m, pid_n, bM, bN, **_):
     tCsC    = thr_mma.partition_C(sC)
-    gC_tile = cute.local_tile(gC, (bM, 1, bN), (pid_m, pid_n, 0))[None, 0, None]
+    gC_tile = cute.local_tile(gC, (bM, bN), (pid_m, pid_n))
     tCgC    = thr_mma.partition_C(gC_tile)
 
     gate = tCrC.load()

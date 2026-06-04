@@ -4,7 +4,6 @@ os.environ["CUTE_DSL_LINEINFO"] = "1"
 from dataclasses import dataclass
 from enum import IntEnum
 
-
 import cutlass
 import cutlass.cute as cute
 from cutlass.cute.nvgpu import cpasync
@@ -295,18 +294,35 @@ class LLMMegaKernel:
         )
         tma_o, g_o = cpasync.make_tiled_tma_atom(store_op, mO, sO_tile, (1, 1, self.bQ, d + PAD))
 
-        self.rmsnorm = RMSNorm(self.rms_cfg, g_emb_rows, g_ws1_rows, g_rms_w,
-                               tma_w=tma_rms_w, tma_in=tma_emb_rows, tma_out=tma_ws1_rows)
-        self.qkv  = Matmul(self.mm_cfg, g_ws1_A,    g_qkv_w,  g_ws2_qkv,  tma_ws1_A,    tma_qkv_w,  basic_store,        tma_ws2_qkv)
-        self.out  = Matmul(self.mm_cfg, g_ws1_A,    g_out_w,  g_emb_red,  tma_ws1_A,    tma_out_w,  residual_add_store, tma_emb_red)
-        self.up   = Matmul(self.mm_cfg, g_ws1_A,    g_up_w,   g_ws2_ff_s, tma_ws1_A,    tma_up_w,   basic_store,        tma_ws2_ff_s)
-        self.gate = Matmul(self.mm_cfg, g_ws1_A,    g_gate_w, g_ws2_ff_s, tma_ws1_A,    tma_gate_w, silu_mul,           tma_ws2_ff_s)
-        self.down = Matmul(self.mm_cfg, g_ws2_ff_A, g_down_w, g_emb_red,  tma_ws2_ff_A, tma_down_w, residual_add_store, tma_emb_red)
-        self.attn = Attention(self.attn_cfg, mQ, mK, mV, mO, tma_o, g_o)
+        # Ops hold ONLY constexpr config (+ the epilogue callable). All tensors and
+        # TMA atoms are passed into run() as arguments from the kernel. This keeps the
+        # op objects constexpr so they can be reached through `self` inside the dynamic
+        # dispatch loop without being treated as loop-carried values.
+        self.rmsnorm = RMSNorm(self.rms_cfg)
+        self.qkv  = Matmul(self.mm_cfg, basic_store)
+        self.out  = Matmul(self.mm_cfg, residual_add_store)
+        self.up   = Matmul(self.mm_cfg, basic_store)
+        self.gate = Matmul(self.mm_cfg, silu_mul)
+        self.down = Matmul(self.mm_cfg, residual_add_store)
+        self.attn = Attention(self.attn_cfg)
 
         SharedStorage = self._get_smem_storage()
 
-        self.kernel(mSchedule, mAtomics, SharedStorage).launch(
+        self.kernel(mSchedule, mAtomics,
+                    g_rms_w, g_emb_rows, g_ws1_rows,
+                    g_ws1_A, g_qkv_w, g_ws2_qkv,
+                    g_out_w, g_emb_red,
+                    g_up_w, g_gate_w, g_ws2_ff_s,
+                    g_ws2_ff_A, g_down_w,
+                    mEmbedding, mWS2_MF,
+                    mQ, mK, mV, mO, g_o,
+                    tma_rms_w, tma_emb_rows, tma_ws1_rows,
+                    tma_ws1_A, tma_qkv_w, tma_ws2_qkv,
+                    tma_out_w, tma_emb_red,
+                    tma_up_w, tma_gate_w, tma_ws2_ff_s,
+                    tma_ws2_ff_A, tma_down_w,
+                    tma_o,
+                    SharedStorage).launch(
             grid=(self.num_sms,),
             block=(256,),
         )
@@ -315,7 +331,21 @@ class LLMMegaKernel:
     # Device kernel: dispatch loop only
     # -----------------------------------------------------------------------
     @cute.kernel
-    def kernel(self, mSchedule, mAtomics, SharedStorage: cutlass.Constexpr):
+    def kernel(self, mSchedule, mAtomics,
+               g_rms_w, g_emb_rows, g_ws1_rows,
+               g_ws1_A, g_qkv_w, g_ws2_qkv,
+               g_out_w, g_emb_red,
+               g_up_w, g_gate_w, g_ws2_ff_s,
+               g_ws2_ff_A, g_down_w,
+               mEmbedding, mWS2_MF,
+               mQ, mK, mV, mO, g_o,
+               tma_rms_w, tma_emb_rows, tma_ws1_rows,
+               tma_ws1_A, tma_qkv_w, tma_ws2_qkv,
+               tma_out_w, tma_emb_red,
+               tma_up_w, tma_gate_w, tma_ws2_ff_s,
+               tma_ws2_ff_A, tma_down_w,
+               tma_o,
+               SharedStorage: cutlass.Constexpr):
         warp_id    = cute.arch.warp_idx()
         group_id   = warp_id // 4
         local_warp = warp_id %  4
@@ -325,20 +355,20 @@ class LLMMegaKernel:
         wg = WarpgroupMeta(tidx=tidx, group_tidx=group_tid, group_id=group_id, lane_id=tidx % 32, warp_id=local_warp)
 
         if local_warp == 0:
-            cpasync.prefetch_descriptor(self.rmsnorm.tma_w)     # rms weight
-            cpasync.prefetch_descriptor(self.rmsnorm.tma_in)    # emb rows
-            cpasync.prefetch_descriptor(self.rmsnorm.tma_out)   # ws1 rows
-            cpasync.prefetch_descriptor(self.qkv.tma_atom_A)    # ws1 A
-            cpasync.prefetch_descriptor(self.qkv.tma_atom_B)    # qkv w
-            cpasync.prefetch_descriptor(self.qkv.tma_atom_C)    # ws2 qkv
-            cpasync.prefetch_descriptor(self.out.tma_atom_B)    # out w
-            cpasync.prefetch_descriptor(self.out.tma_atom_C)    # emb red
-            cpasync.prefetch_descriptor(self.up.tma_atom_B)     # up w
-            cpasync.prefetch_descriptor(self.up.tma_atom_C)     # ws2 ff
-            cpasync.prefetch_descriptor(self.gate.tma_atom_B)   # gate w
-            cpasync.prefetch_descriptor(self.down.tma_atom_A)   # ws2 ff A
-            cpasync.prefetch_descriptor(self.down.tma_atom_B)   # down w
-            cpasync.prefetch_descriptor(self.attn.tma_out)      # attn o
+            cpasync.prefetch_descriptor(tma_rms_w)
+            cpasync.prefetch_descriptor(tma_emb_rows)
+            cpasync.prefetch_descriptor(tma_ws1_rows)
+            cpasync.prefetch_descriptor(tma_ws1_A)
+            cpasync.prefetch_descriptor(tma_qkv_w)
+            cpasync.prefetch_descriptor(tma_ws2_qkv)
+            cpasync.prefetch_descriptor(tma_out_w)
+            cpasync.prefetch_descriptor(tma_emb_red)
+            cpasync.prefetch_descriptor(tma_up_w)
+            cpasync.prefetch_descriptor(tma_gate_w)
+            cpasync.prefetch_descriptor(tma_ws2_ff_s)
+            cpasync.prefetch_descriptor(tma_ws2_ff_A)
+            cpasync.prefetch_descriptor(tma_down_w)
+            cpasync.prefetch_descriptor(tma_o)
 
         smem    = SmemAllocator()
         storage = smem.allocate(SharedStorage)
@@ -358,11 +388,11 @@ class LLMMegaKernel:
                     cute.arch.mbarrier_init(load_barriers + i, 1)
                 cute.arch.mbarrier_init(pp_barriers + 0, 128)
                 cute.arch.mbarrier_init(pp_barriers + 1, 128)
-                cute.arch.mbarrier_init_fence()
                 for i in cutlass.range_constexpr(2):
                     cute.arch.mbarrier_init(input_barriers + i, 128)
                     cute.arch.mbarrier_init(output_barriers + i, 128)
                     cute.arch.mbarrier_init(compute_barriers + i, 128)
+                cute.arch.mbarrier_init_fence()
         cute.arch.sync_threads()
 
         if group_id == 1:
@@ -390,27 +420,34 @@ class LLMMegaKernel:
 
             if op_kind == cutlass.Int32(int(Op.RMS)):
                 rms_w_idx = layer_idx * 2 + pid_o
-                self.rmsnorm.run(rms_w_idx, pid_m, mAtomics, expected_cnt, atomic_idx, next_idx,
+                self.rmsnorm.run(g_emb_rows, g_ws1_rows, g_rms_w, tma_rms_w, tma_emb_rows, tma_ws1_rows,
+                                 rms_w_idx, pid_m, mAtomics, expected_cnt, atomic_idx, next_idx,
                                  storage, pid_n, wg, compute_mbar_phase, input_mbar_phase, output_mbar_phase)
             elif op_kind == cutlass.Int32(int(Op.QKV)):
-                self.qkv.run(layer_idx, pid_m, pid_n, mAtomics, expected_cnt, atomic_idx, next_idx,
+                self.qkv.run(g_ws1_A, g_qkv_w, g_ws2_qkv, None, tma_ws1_A, tma_qkv_w, tma_ws2_qkv,
+                             layer_idx, pid_m, pid_n, mAtomics, expected_cnt, atomic_idx, next_idx,
                              storage, wg, compute_mbar_phase, input_mbar_phase, output_mbar_phase)
             elif op_kind == cutlass.Int32(int(Op.ATTN)):
-                self.attn.run(pid_m, pid_n, pid_o, mAtomics, expected_cnt, atomic_idx, next_idx,
+                self.attn.run(mQ, mK, mV, mO, tma_o, g_o,
+                              pid_m, pid_n, pid_o, mAtomics, expected_cnt, atomic_idx, next_idx,
                               storage, wg, compute_mbar_phase, input_mbar_phase, output_mbar_phase)
             elif op_kind == cutlass.Int32(int(Op.OUT)):
-                self.out.run(layer_idx, pid_m, pid_n, mAtomics, expected_cnt, atomic_idx, next_idx,
+                self.out.run(g_ws1_A, g_out_w, g_emb_red, mEmbedding, tma_ws1_A, tma_out_w, tma_emb_red,
+                             layer_idx, pid_m, pid_n, mAtomics, expected_cnt, atomic_idx, next_idx,
                              storage, wg, compute_mbar_phase, input_mbar_phase, output_mbar_phase)
             elif op_kind == cutlass.Int32(int(Op.UP)):
-                self.up.run(layer_idx, pid_m, pid_n, mAtomics, expected_cnt, atomic_idx, next_idx,
+                self.up.run(g_ws1_A, g_up_w, g_ws2_ff_s, None, tma_ws1_A, tma_up_w, tma_ws2_ff_s,
+                            layer_idx, pid_m, pid_n, mAtomics, expected_cnt, atomic_idx, next_idx,
                             storage, wg, compute_mbar_phase, input_mbar_phase, output_mbar_phase)
             elif op_kind == cutlass.Int32(int(Op.GATE)):
-                self.gate.run(layer_idx, pid_m, pid_n, mAtomics, expected_cnt, atomic_idx, next_idx,
+                self.gate.run(g_ws1_A, g_gate_w, g_ws2_ff_s, mWS2_MF, tma_ws1_A, tma_gate_w, tma_ws2_ff_s,
+                              layer_idx, pid_m, pid_n, mAtomics, expected_cnt, atomic_idx, next_idx,
                               storage, wg, compute_mbar_phase, input_mbar_phase, output_mbar_phase)
             elif op_kind == cutlass.Int32(int(Op.DOWN)):
-                self.down.run(layer_idx, pid_m, pid_n, mAtomics, expected_cnt, atomic_idx, next_idx,
+                self.down.run(g_ws2_ff_A, g_down_w, g_emb_red, mEmbedding, tma_ws2_ff_A, tma_down_w, tma_emb_red,
+                              layer_idx, pid_m, pid_n, mAtomics, expected_cnt, atomic_idx, next_idx,
                               storage, wg, compute_mbar_phase, input_mbar_phase, output_mbar_phase)
 
             compute_mbar_phase = compute_mbar_phase ^ cutlass.Int32(1)
-            input_mbar_phase = input_mbar_phase ^ cutlass.Int32(1)
-            output_mbar_phase = output_mbar_phase ^ cutlass.Int32(1)
+            input_mbar_phase   = input_mbar_phase ^ cutlass.Int32(1)
+            output_mbar_phase  = output_mbar_phase ^ cutlass.Int32(1)

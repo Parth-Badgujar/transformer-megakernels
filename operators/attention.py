@@ -1,4 +1,6 @@
 import math
+from functools import partial
+
 import cutlass
 import cutlass.cute as cute
 from cutlass.cute.nvgpu import cpasync, warp
@@ -31,16 +33,8 @@ class AttentionConfig:
 
 
 class Attention:
-    def __init__(self, config: AttentionConfig,
-                 mQ: cute.Tensor, mK: cute.Tensor, mV: cute.Tensor, mO: cute.Tensor,
-                 tma_out: cute.CopyAtom, gO: cute.Tensor):
-        self.config  = config
-        self.mQ      = mQ
-        self.mK      = mK
-        self.mV      = mV
-        self.mO      = mO
-        self.tma_out = tma_out
-        self.gO      = gO
+    def __init__(self, config: AttentionConfig):
+        self.config = config
 
     @staticmethod
     @cute.jit
@@ -66,7 +60,19 @@ class Attention:
         return cute.make_tensor(rP.iterator, mma_view)
 
     @cute.jit
-    def run(self, b, h, qb,
+    def _wg_sync(self, *, group_id):
+        cute.arch.barrier(barrier_id=12 + group_id, number_of_threads=128)
+
+    @cute.jit
+    def _wait_prev(self, *, expected_cnt, mAtomics, atomic_idx, group_tid):
+        if group_tid == 0:
+            ready = cutlass.Int32(0)
+            while ready != expected_cnt:
+                ready = ld_acquire_u32((mAtomics.iterator + atomic_idx).toint())
+
+    @cute.jit
+    def run(self, mQ, mK, mV, mO, tma_out, gO,
+            b, h, qb,
             mAtomics, expected_cnt, atomic_idx, next_idx, storage,
             warpgroup: WarpgroupMeta, compute_mbar_phase, input_mbar_phase, output_bar_phase):
         cfg      = self.config
@@ -80,6 +86,8 @@ class Attention:
         nS       = cfg.num_stages
         SE       = cfg.stage_skip
         PAD      = cfg.output_pad
+        group_id  = warpgroup.group_id
+        group_tid = warpgroup.group_tidx
 
         h_kv = h * H_kv // H_q
         BF   = cutlass.BFloat16
@@ -113,14 +121,14 @@ class Attention:
 
         sVt = cute.composition(sV, cute.make_layout((d, bKV), stride=(bKV, 1)))
 
-        other = warpgroup.group_id ^ 1
-        self.input_bar_me   = storage.barriers.input_barrier.data_ptr()   + warpgroup.group_id
-        self.input_bar_ot   = storage.barriers.input_barrier.data_ptr()   + other
-        self.compute_bar_me = storage.barriers.compute_barrier.data_ptr() + warpgroup.group_id
-        self.compute_bar_ot = storage.barriers.compute_barrier.data_ptr() + other
-        self.output_bar_me  = storage.barriers.output_barrier.data_ptr()  + warpgroup.group_id
-        self.output_bar_ot  = storage.barriers.output_barrier.data_ptr()  + other
-        cute.arch.mbarrier_wait(self.input_bar_me, input_mbar_phase)
+        other = group_id ^ 1
+        input_bar_me   = storage.barriers.input_barrier.data_ptr()   + group_id
+        input_bar_ot   = storage.barriers.input_barrier.data_ptr()   + other
+        compute_bar_me = storage.barriers.compute_barrier.data_ptr() + group_id
+        compute_bar_ot = storage.barriers.compute_barrier.data_ptr() + other
+        output_bar_me  = storage.barriers.output_barrier.data_ptr()  + group_id
+        output_bar_ot  = storage.barriers.output_barrier.data_ptr()  + other
+        cute.arch.mbarrier_wait(input_bar_me, input_mbar_phase)
 
         async_elems     = 128 // 16
         cols_per_pass   = d // async_elems
@@ -128,17 +136,17 @@ class Attention:
         tQ_layout       = cute.make_ordered_layout((rows_per_pass, cols_per_pass), order=(1, 0))
         vQ_layout       = cute.make_layout((1, async_elems))
         gmem_tiled_copy = cute.make_tiled_copy_tv(atom_async, tQ_layout, vQ_layout)
-        gmem_thr_copy   = gmem_tiled_copy.get_slice(warpgroup.group_tidx)
+        gmem_thr_copy   = gmem_tiled_copy.get_slice(group_tid)
 
         smem_atom_QK = cute.make_copy_atom(warp.LdMatrix8x8x16bOp(transpose=False, num_matrices=4), BF)
         smem_atom_V  = cute.make_copy_atom(warp.LdMatrix8x8x16bOp(transpose=True,  num_matrices=4), BF)
-        smem_thr_Q   = cute.make_tiled_copy_A(smem_atom_QK, tiled_mma_qk).get_slice(warpgroup.group_tidx)
-        smem_thr_K   = cute.make_tiled_copy_B(smem_atom_QK, tiled_mma_qk).get_slice(warpgroup.group_tidx)
-        smem_thr_V   = cute.make_tiled_copy_B(smem_atom_V,  tiled_mma_pv).get_slice(warpgroup.group_tidx)
+        smem_thr_Q   = cute.make_tiled_copy_A(smem_atom_QK, tiled_mma_qk).get_slice(group_tid)
+        smem_thr_K   = cute.make_tiled_copy_B(smem_atom_QK, tiled_mma_qk).get_slice(group_tid)
+        smem_thr_V   = cute.make_tiled_copy_B(smem_atom_V,  tiled_mma_pv).get_slice(group_tid)
 
-        gQ = cute.local_tile(self.mQ[b, h,    None, None], (bQ,  d), (qb,   0))
-        gK = cute.local_tile(self.mK[b, h_kv, None, None], (bKV, d), (None, 0))
-        gV = cute.local_tile(self.mV[b, h_kv, None, None], (bKV, d), (None, 0))
+        gQ = cute.local_tile(mQ[b, h,    None, None], (bQ,  d), (qb,   0))
+        gK = cute.local_tile(mK[b, h_kv, None, None], (bKV, d), (None, 0))
+        gV = cute.local_tile(mV[b, h_kv, None, None], (bKV, d), (None, 0))
 
         tQgQ = gmem_thr_copy.partition_S(gQ)
         tQsQ = gmem_thr_copy.partition_D(sQ)
@@ -147,8 +155,8 @@ class Attention:
         tVgV = gmem_thr_copy.partition_S(gV)
         tVsV = gmem_thr_copy.partition_D(sV)
 
-        thr_mma_qk = tiled_mma_qk.get_slice(warpgroup.group_tidx)
-        thr_mma_pv = tiled_mma_pv.get_slice(warpgroup.group_tidx)
+        thr_mma_qk = tiled_mma_qk.get_slice(group_tid)
+        thr_mma_pv = tiled_mma_pv.get_slice(group_tid)
 
         tSrQ = thr_mma_qk.make_fragment_A(thr_mma_qk.partition_A(sQ))
         tSrK = thr_mma_qk.make_fragment_B(thr_mma_qk.partition_B(sK))
@@ -178,21 +186,14 @@ class Attention:
 
         num_kv_blocks = kv_len // bKV
 
-        @cute.jit
-        def warpgroup_sync():
-            cute.arch.barrier(barrier_id=12 + warpgroup.group_id, number_of_threads=128)
+        wg_sync   = partial(self._wg_sync, group_id=group_id)
+        wait_prev = partial(self._wait_prev, expected_cnt=expected_cnt,
+                            mAtomics=mAtomics, atomic_idx=atomic_idx, group_tid=group_tid)
 
-        @cute.jit
-        def wait_for_previous_activations():
-            if warpgroup.group_tidx == 0:
-                ready = cutlass.Int32(0)
-                while ready != expected_cnt:
-                    ready = ld_acquire_u32((mAtomics.iterator + atomic_idx).toint())
+        smem_thr_Ow = cute.make_tiled_copy_C(smem_store_bf, tiled_mma_pv).get_slice(group_tid)
 
-        smem_thr_Ow = cute.make_tiled_copy_C(smem_store_bf, tiled_mma_pv).get_slice(warpgroup.group_tidx)
-
-        wait_for_previous_activations()
-        warpgroup_sync()
+        wait_prev()
+        wg_sync()
 
         cute.copy(gmem_tiled_copy, tQgQ, tQsQ)
         cute.arch.cp_async_commit_group()
@@ -200,14 +201,14 @@ class Attention:
         cute.arch.cp_async_commit_group()
 
         cute.arch.cp_async_wait_group(1)
-        warpgroup_sync()
+        wg_sync()
         cute.copy(smem_thr_Q, tSsQ, tSrQ_view)
 
-        cute.arch.mbarrier_wait(self.compute_bar_me, compute_mbar_phase)
+        cute.arch.mbarrier_wait(compute_bar_me, compute_mbar_phase)
         fence_proxy_async_shared_cta()
-        warpgroup_sync()
+        wg_sync()
 
-        for n in cutlass.range(num_kv_blocks):
+        for n in cutlass.range(num_kv_blocks, unroll=1):
             cute.copy(gmem_tiled_copy, tVgV[None, None, None, n], tVsV)
             cute.arch.cp_async_commit_group()
 
@@ -216,7 +217,7 @@ class Attention:
             tSsK      = smem_thr_K.partition_S(sK)
             tSrK_view = smem_thr_K.retile(tSrK)
             cute.arch.cp_async_wait_group(1)
-            warpgroup_sync()
+            wg_sync()
 
             cute.copy(smem_thr_K, tSsK, tSrK_view)
             cute.gemm(tiled_mma_qk, acc_S, tSrQ, tSrK, acc_S)
@@ -251,39 +252,39 @@ class Attention:
             tOsVt     = smem_thr_V.partition_S(sVt)
             tOrV_view = smem_thr_V.retile(tOrV)
             cute.arch.cp_async_wait_group(0)
-            warpgroup_sync()
+            wg_sync()
             cute.copy(smem_thr_V, tOsVt, tOrV_view)
             cute.gemm(tiled_mma_pv, acc_O, tOrS, tOrV, acc_O)
-            warpgroup_sync()
+            wg_sync()
 
-        cute.arch.mbarrier_arrive(self.input_bar_ot)
+        cute.arch.mbarrier_arrive(input_bar_ot)
         acc_O_mn = Attention._reshape_acc_to_mn(acc_O)
         for r in cutlass.range_constexpr(num_rows_per_thr):
             row_sum[r] = cute.arch.warp_reduction_sum(row_sum[r], threads_in_group=4)
             inv = cute.arch.rcp_approx(row_sum[r] if row_sum[r] != 0.0 else cutlass.Float32(1.0))
             acc_O_mn[r, None].store(acc_O_mn[r, None].load() * inv)
 
-        cute.arch.mbarrier_wait(self.output_bar_me, output_bar_phase)
-        cute.arch.mbarrier_arrive(self.compute_bar_ot)
+        cute.arch.mbarrier_wait(output_bar_me, output_bar_phase)
+        cute.arch.mbarrier_arrive(compute_bar_ot)
 
         rO_bf = cute.make_fragment_like(acc_O, BF)
         rO_bf.store(acc_O.load().to(BF))
         taccOsO = smem_thr_Ow.partition_D(sO)
         taccOrO = smem_thr_Ow.retile(rO_bf)
         cute.copy(smem_store_bf, taccOrO, taccOsO)
-        warpgroup_sync()
+        wg_sync()
         fence_proxy_async_shared_cta()
 
-        if warpgroup.group_tidx == 0:
-            gO_tma = cute.local_tile(self.gO, (1, 1, bQ, d + PAD), (b, h, qb, 0))
+        if group_tid == 0:
+            gO_tma = cute.local_tile(gO, (1, 1, bQ, d + PAD), (b, h, qb, 0))
             sO_g = cute.group_modes(sO_tma, 0, cute.rank(sO_tma.layout))
             gO_g = cute.group_modes(gO_tma, 0, cute.rank(gO_tma.layout))
-            sO_part, gO_part = cpasync.tma_partition(self.tma_out, 0, cute.make_layout(1), sO_g, gO_g)
-            cute.copy(self.tma_out, sO_part, gO_part)
+            sO_part, gO_part = cpasync.tma_partition(tma_out, 0, cute.make_layout(1), sO_g, gO_g)
+            cute.copy(tma_out, sO_part, gO_part)
             cute.arch.cp_async_bulk_commit_group()
             cute.arch.cp_async_bulk_wait_group(0)
             fence_proxy_async_global()
 
-        cute.arch.mbarrier_arrive(self.output_bar_ot)
-        if warpgroup.group_tidx == 0:
+        cute.arch.mbarrier_arrive(output_bar_ot)
+        if group_tid == 0:
             atomic_add_release((mAtomics.iterator + next_idx).toint(), cutlass.Int32(1))
