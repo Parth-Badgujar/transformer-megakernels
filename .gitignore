@@ -11,3 +11,4 @@ wheels/
 *.pt
 *.ptx
 *.cubin
+*.ncu-rep

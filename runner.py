@@ -32,5 +32,6 @@ def main():
         batch.put_directory("./operators", "operators")
         batch.put_file("bench.py", "bench.py")
         batch.put_file("scheduler.py", "scheduler.py")
+        batch.put_file("model.py", "model.py")
         batch.put_file("bench.py", "bench.py")
     runner.remote()
