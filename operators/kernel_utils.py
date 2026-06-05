@@ -1,14 +1,3 @@
-"""
-Shared low-level primitives used by every op class in the megakernel:
-
-    * ld_acquire_u32           - acquire load of a u32 from global (atomic poll)
-    * atomic_add_release       - atomicAdd(+val) with release semantics
-    * nanosleep                - PTX nanosleep, used to back off when polling
-    * fence_proxy_async_shared_cta - generic-proxy -> async-proxy fence on smem
-
-LOG2_E is used by the softmax fast-path (exp -> exp2 conversion).
-"""
-
 from dataclasses import dataclass
 import math
 
@@ -78,6 +67,18 @@ def fence_proxy_async_shared_cta(*, loc=None, ip=None) -> None:
         ir.Type.parse("!llvm.void"),
         [],
         "fence.proxy.async.shared::cta;",
+        "",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+@dsl_user_op
+def fence_proxy_async(*, loc=None, ip=None) -> None:
+    llvm.inline_asm(
+        ir.Type.parse("!llvm.void"),
+        [],
+        "fence.proxy.async;",
         "",
         has_side_effects=True,
         is_align_stack=False,

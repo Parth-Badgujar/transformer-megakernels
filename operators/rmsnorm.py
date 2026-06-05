@@ -118,8 +118,8 @@ class RMSNorm:
 
         @cute.jit
         def store_outputs_async(stage, idx):
-            warpgroup_sync()
             fence_proxy_async_shared_cta()
+            warpgroup_sync()
             if local_warp == 0:
                 cute.copy(tma_out, tOsO[None, stage], tOgO[None, off_m + idx])
                 cute.arch.cp_async_bulk_commit_group()

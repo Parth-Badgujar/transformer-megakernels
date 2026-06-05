@@ -1,8 +1,8 @@
-import os 
+import os
 os.environ["CUTE_DSL_LINEINFO"] = "1"
 os.environ["CUTE_DSL_KEEP_PTX"] = "1"
 import time
-import math 
+import math
 import torch
 import argparse
 import cutlass.cute as cute
@@ -13,7 +13,7 @@ from scheduler import get_attn_schedule
 from model import MultiLayerTransformer, extract_weights
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--n_iters", type = int, default = 1000)
+parser.add_argument("--n_iters", type = int, default = 100)
 args = parser.parse_args()
 n_iters = args.n_iters
 
@@ -36,8 +36,8 @@ num_q_heads  = 4
 num_kv_heads = 4
 num_stages   = 3
 is_causal    = False
-num_layers   = 8
-ff_dim       = 1024
+num_layers   = 4
+ff_dim       = 512
 
 embed_dim  = num_q_heads * head_dim
 qkv_dim    = (num_q_heads + 2 * num_kv_heads) * head_dim
@@ -83,6 +83,11 @@ model = MultiLayerTransformer(
 ).cuda()
 model.eval()
 
+s = 0
+for p in model.parameters():
+    s += p.numel()
+print("Total Parameters :", s)
+
 rms_w, qkv_w, out_w, gate_w, up_w, down_w = extract_weights(model)
 
 sample_input = torch.randn(batch_size, seq_len, embed_dim, dtype=dtype, device=device)
@@ -105,10 +110,17 @@ cGate_w    = from_dlpack(gate_w,    assumed_align = 16)
 cUp_w      = from_dlpack(up_w,      assumed_align = 16)
 cDown_w    = from_dlpack(down_w,    assumed_align = 16)
 cOut_w     = from_dlpack(out_w,     assumed_align = 16)
+embeddings_arr = []
+for i in range(5):
+    embeddings_arr.append(embedding.clone())
+c_embedding_arr = []
+for i in range(5):
+    c_embedding_arr.append(from_dlpack(embeddings_arr[i], assumed_align = 16))
 cEmbedding = from_dlpack(embedding, assumed_align = 16)
 
 kernel = LLMMegaKernel(cfg)
-
+os.system("rm *.ptx")
+os.system("rm *.cubin")
 ref = model(sample_input)
 print("[compile] starting", flush=True)
 t0 = time.time()
@@ -119,27 +131,31 @@ compiled = cute.compile(
 )
 print(f"[compile] done in {time.time() - t0:.2f}s", flush=True)
 
-compiled(cSchedule, cAtomics, cRms_w, cQkv_w, cWs1, cWs2,
-         cGate_w, cUp_w, cDown_w, cOut_w, cEmbedding)
-torch.cuda.synchronize()
+
 if os.path.exists("/opt/watchdog/users/parth/cuda13.2/bin/ptxas"):
     os.system("/opt/watchdog/users/parth/cuda13.2/bin/ptxas --gpu-name sm_120a --output-file megakernel.cubin --verbose cutlass*.ptx")
 else:
     os.system("ptxas --gpu-name sm_120a --output-file megakernel.cubin --verbose cutlass*.ptx")
 
+for i in range(5):
+    mAtomics.zero_()
+    compiled(cSchedule, cAtomics, cRms_w, cQkv_w, cWs1, cWs2,
+            cGate_w, cUp_w, cDown_w, cOut_w, c_embedding_arr[i])
+    torch.cuda.synchronize()
+    torch.save(ref, f"ref_v{i}.pt")
+    embeddings_arr[i] = embeddings_arr[i].view(batch_size, seq_len, -1)
+    torch.save(embeddings_arr[i], f"out_v{i}.pt")
+    diff     = (embeddings_arr[i].float() - ref.float()).abs()
+    max_err  = diff.max().item()
+    mean_err = diff.mean().item()
+    rel_err  = (diff / (ref.float().abs() + 1e-6)).mean().item()
 
-embedding = embedding.view(batch_size, seq_len, -1)
-diff     = (embedding.float() - ref.float()).abs()
-max_err  = diff.max().item()
-mean_err = diff.mean().item()
-rel_err  = (diff / (ref.float().abs() + 1e-6)).mean().item()
-
-print(f"\nResults:")
-print(f"  Max  abs error    : {max_err:.6f}")
-print(f"  Mean abs error    : {mean_err:.6f}")
-print(f"  Mean rel error    : {rel_err:.6f}")
-print(f"  Kernel output norm: {embedding.float().norm():.4f}")
-print(f"  Ref    output norm: {ref.float().norm():.4f}\n")
+    print(f"\nResults:")
+    print(f"  Max  abs error    : {max_err:.6f}")
+    print(f"  Mean abs error    : {mean_err:.6f}")
+    print(f"  Mean rel error    : {rel_err:.6f}")
+    print(f"  Kernel output norm: {embeddings_arr[i].float().norm():.4f}")
+    print(f"  Ref    output norm: {ref.float().norm():.4f}\n")
 
 warmup  = 5
 

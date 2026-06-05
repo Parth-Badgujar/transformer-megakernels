@@ -24,8 +24,9 @@ def basic_store(*, thr_mma, tCrC, sC, warpgroup, **_):
     tCrD = cute.make_fragment_like(tCrC, cutlass.BFloat16)
     tCrD.store(tCrC.load().to(cutlass.BFloat16))
     cute.autovec_copy(tCrD, tCsC)
-    cute.arch.barrier(barrier_id=8 + warpgroup.group_id, number_of_threads=128)
     fence_proxy_async_shared_cta()
+    cute.arch.barrier(barrier_id=8 + warpgroup.group_id, number_of_threads=128)
+
 
 
 @cute.jit
@@ -45,8 +46,9 @@ def residual_add_store(*, thr_mma, tCrC, sC, warpgroup,
         tCrD    = cute.make_fragment_like(tCrC, cutlass.BFloat16)
         tCrD.store(sum_f32.to(cutlass.BFloat16))
         cute.autovec_copy(tCrD, tCsC)
-    cute.arch.barrier(barrier_id=8 + warpgroup.group_id, number_of_threads=128)
     fence_proxy_async_shared_cta()
+    cute.arch.barrier(barrier_id=8 + warpgroup.group_id, number_of_threads=128)
+
 
 
 @cute.jit
@@ -66,6 +68,5 @@ def silu_mul(*, thr_mma, tCrC, sC, warpgroup,
     tCrD     = cute.make_fragment_like(tCrC, cutlass.BFloat16)
     tCrD.store(prod_f32.to(cutlass.BFloat16))
     cute.autovec_copy(tCrD, tCsC)
-
-    cute.arch.barrier(barrier_id=8 + warpgroup.group_id, number_of_threads=128)
     fence_proxy_async_shared_cta()
+    cute.arch.barrier(barrier_id=8 + warpgroup.group_id, number_of_threads=128)

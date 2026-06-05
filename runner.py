@@ -23,7 +23,7 @@ def runner():
     # subprocess.run(["python3", "bench_2_qkv.py", "--n_iters", "1000"])
     # subprocess.run(["python3", "bench_3_attn.py", "--n_iters", "1000"])
     # subprocess.run(["python3", "bench_4_out.py"])
-    subprocess.run(["python3", "bench.py", "--n_iters", "10000"])
+    subprocess.run(["python3", "bench.py", "--n_iters", "1"])
     vol.commit()
 
 @app.local_entrypoint()
