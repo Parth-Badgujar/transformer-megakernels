@@ -17,6 +17,17 @@ class WarpgroupMeta:
     lane_id: int
     warp_id: int
 
+@dataclass
+class Phases:
+    compute_phase: int
+    input_phase: int
+    output_phase: int
+
+@dataclass
+class PipelineMeta:
+    current_idx: int
+    next_idx: int
+    expected_cnt: int
 
 @dsl_user_op
 def ld_acquire_u32(ptr, *, loc=None, ip=None) -> cutlass.Int32:

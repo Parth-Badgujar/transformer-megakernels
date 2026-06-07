@@ -59,9 +59,7 @@ def silu_mul(*, thr_mma, tCrC, sC, warpgroup,
     tCgC    = thr_mma.partition_C(gC_tile)
 
     gate = tCrC.load()
-    silu = gate * (cutlass.Float32(1.0) /
-                   (cutlass.Float32(1.0) + cute.math.exp(-gate, fastmath=True)))
-
+    silu = gate  / (cutlass.Float32(1.0) + cute.math.exp(-gate, fastmath=True))
     rUp = cute.make_fragment_like(tCrC, cutlass.BFloat16)
     cute.autovec_copy(tCgC, rUp)
     prod_f32 = silu * rUp.load().to(cutlass.Float32)

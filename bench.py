@@ -8,9 +8,9 @@ import argparse
 import cutlass.cute as cute
 from cutlass.cute.runtime import from_dlpack
 
-from megakernel import LLMMegaKernel, LLMMegaKernelConfig
+from src.megakernel.megakernel import LLMMegaKernel, LLMMegaKernelConfig
 from scheduler import get_attn_schedule
-from model import MultiLayerTransformer, extract_weights
+from src.megakernel.model import MultiLayerTransformer, extract_weights
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--n_iters", type = int, default = 100)
@@ -36,7 +36,7 @@ num_q_heads  = 4
 num_kv_heads = 4
 num_stages   = 3
 is_causal    = False
-num_layers   = 4
+num_layers   = 64
 ff_dim       = 512
 
 embed_dim  = num_q_heads * head_dim
@@ -69,8 +69,8 @@ cfg = LLMMegaKernelConfig(
     bR                 = 4,
     num_stages_rms     = 3,
     rows_per_rms_block = rows_per_rms_block,
-    use_tma_reduce = True,
-    output_pad = 16
+    use_tma_reduce = False,
+    output_pad = 0
 )
 
 sched, atoms, max_works = get_attn_schedule(cfg)
@@ -82,6 +82,15 @@ model = MultiLayerTransformer(
     embed_dim, num_q_heads, num_kv_heads, ff_dim, num_layers, is_causal=is_causal
 ).cuda()
 model.eval()
+# model_f32 = model.to(torch.float32)
+model_f32 = MultiLayerTransformer(
+    embed_dim, num_q_heads, num_kv_heads, ff_dim, num_layers, is_causal=is_causal, dtype = torch.float32
+).cuda()
+model_f32.eval()
+
+for n,p in model.named_parameters():
+    p_f32 = model_f32.get_parameter(n)
+    p_f32.data.copy_(p.data.float())
 
 s = 0
 for p in model.parameters():
@@ -91,6 +100,7 @@ print("Total Parameters :", s)
 rms_w, qkv_w, out_w, gate_w, up_w, down_w = extract_weights(model)
 
 sample_input = torch.randn(batch_size, seq_len, embed_dim, dtype=dtype, device=device)
+sample_input_f32 = sample_input.float()
 
 ws2_dim   = max(qkv_dim, ff_dim)
 embedding = sample_input.view(batch_size * seq_len, -1)
@@ -111,10 +121,11 @@ cUp_w      = from_dlpack(up_w,      assumed_align = 16)
 cDown_w    = from_dlpack(down_w,    assumed_align = 16)
 cOut_w     = from_dlpack(out_w,     assumed_align = 16)
 embeddings_arr = []
-for i in range(5):
+num_rounds = 100
+for i in range(num_rounds):
     embeddings_arr.append(embedding.clone())
 c_embedding_arr = []
-for i in range(5):
+for i in range(num_rounds):
     c_embedding_arr.append(from_dlpack(embeddings_arr[i], assumed_align = 16))
 cEmbedding = from_dlpack(embedding, assumed_align = 16)
 
@@ -122,6 +133,7 @@ kernel = LLMMegaKernel(cfg)
 os.system("rm *.ptx")
 os.system("rm *.cubin")
 ref = model(sample_input)
+ref_f32 = model_f32(sample_input_f32)
 print("[compile] starting", flush=True)
 t0 = time.time()
 compiled = cute.compile(
@@ -137,25 +149,66 @@ if os.path.exists("/opt/watchdog/users/parth/cuda13.2/bin/ptxas"):
 else:
     os.system("ptxas --gpu-name sm_120a --output-file megakernel.cubin --verbose cutlass*.ptx")
 
-for i in range(5):
+max_errs = []
+mean_errs = []
+rel_errs = []
+for i in range(num_rounds):
     mAtomics.zero_()
     compiled(cSchedule, cAtomics, cRms_w, cQkv_w, cWs1, cWs2,
             cGate_w, cUp_w, cDown_w, cOut_w, c_embedding_arr[i])
     torch.cuda.synchronize()
-    torch.save(ref, f"ref_v{i}.pt")
+    # torch.save(ref, f"ref_v{i}.pt")
     embeddings_arr[i] = embeddings_arr[i].view(batch_size, seq_len, -1)
-    torch.save(embeddings_arr[i], f"out_v{i}.pt")
+    # torch.save(embeddings_arr[i], f"out_v{i}.pt")
     diff     = (embeddings_arr[i].float() - ref.float()).abs()
+    diff_f32_out = (embeddings_arr[i].float() - ref_f32.float()).abs()
+    diff_f32_ref = (ref.float() - ref_f32.float()).abs()
     max_err  = diff.max().item()
+    max_err_f32_out = diff_f32_out.max().item()
+    max_err_f32_ref = diff_f32_ref.max().item()
+    
     mean_err = diff.mean().item()
     rel_err  = (diff / (ref.float().abs() + 1e-6)).mean().item()
+    max_errs.append(max_err)
+    mean_errs.append(mean_err)
+    rel_errs.append(rel_err)
+    if i == 0:
+        print(f"\nResults:")
+        print(f"  Max  abs error (bf16 ref vs f32 ref) : {max_err_f32_ref:.6f}")
+        print(f"  Max  abs error (bf16 out vs f32 ref)  : {max_err_f32_out:.6f}")
+        print(f"  Max  abs error (bf16 out vs bf16 ref): {max_err:.6f}")
+        print(f"  Mean abs error    : {mean_err:.6f}")
+        print(f"  Mean rel error    : {rel_err:.6f}")
+        print(f"  Kernel output norm: {embeddings_arr[i].float().norm():.4f}")
+        print(f"  Ref bf16 output norm: {ref.float().norm():.4f}")
+        print(f"  Ref f32 output norm: {ref_f32.norm():.4f}\n")
 
-    print(f"\nResults:")
-    print(f"  Max  abs error    : {max_err:.6f}")
-    print(f"  Mean abs error    : {mean_err:.6f}")
-    print(f"  Mean rel error    : {rel_err:.6f}")
-    print(f"  Kernel output norm: {embeddings_arr[i].float().norm():.4f}")
-    print(f"  Ref    output norm: {ref.float().norm():.4f}\n")
+import numpy as np
+import matplotlib.pyplot as plt
+arr = np.array(max_errs)
+np.save("max_errs.npy", arr)
+fig = plt.figure()
+_, _, patches  =plt.hist(arr)
+plt.bar_label(patches)
+plt.savefig("max_errs.png")
+
+mean_arr = np.array(mean_errs)
+np.save("mean_errs.npy", mean_arr)
+fig = plt.figure()
+_, _, patches  =plt.hist(mean_arr)
+plt.bar_label(patches)
+plt.savefig("mean_errs.png")
+
+
+print("Max (max errs)", max(max_errs))
+print("Max (mean errs)", max(mean_errs))
+print("Max (rel errs)", max(rel_errs))
+
+print("Min (max errs)", min(max_errs))
+print("Min (mean errs)", min(mean_errs))
+print("Min (rel errs)", min(rel_errs))
+
+
 
 warmup  = 5
 

@@ -12,3 +12,12 @@ wheels/
 *.ptx
 *.cubin
 *.ncu-rep
+*.cu
+*.ipynb
+*.clangd
+*.clang-format
+*.txt
+*.png
+*.npy
+cutlass/
+analysis/

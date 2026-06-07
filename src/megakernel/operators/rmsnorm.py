@@ -14,7 +14,6 @@ from operators.kernel_utils import (
 class RMSNormConfig:
     embed_dim: int
     num_stages: int
-    num_stages_rms: int
     bR: int
     rows_per_rms_block: int
     bM: int
@@ -23,8 +22,7 @@ class RMSNormConfig:
     def __post_init__(self):
         assert self.bM % self.rows_per_rms_block == 0
         assert self.rows_per_rms_block % self.bR == 0
-        assert self.num_stages_rms >= 2
-        assert self.num_stages_rms == self.num_stages, "rms shares the matmul stage cursor"
+        assert self.num_stages >= 2
         assert self.embed_dim % 32 == 0
         assert self.bR == 4, "bR must be 4 (one row per warp in a 4-warp WG)"
 
@@ -41,7 +39,7 @@ class RMSNorm:
 
         cfg        = self.config
         E          = cfg.embed_dim
-        nS         = cfg.num_stages_rms
+        nS         = cfg.num_stages
         bR         = cfg.bR
         chunks     = cfg.rows_per_rms_block // cfg.bR
         n_per_thr  = E // 32
@@ -107,6 +105,7 @@ class RMSNorm:
                     ready = cutlass.Int32(0)
                     while ready != expected_cnt:
                         ready = ld_acquire_u32((mAtomics.iterator + atomic_idx).toint())
+            fence_proxy_async_global()
             warpgroup_sync()
 
         @cute.jit
@@ -171,6 +170,8 @@ class RMSNorm:
             cute.copy(tma_w, gW_part, sW_part, tma_bar_ptr=load_bar + stage)
 
         wait_for_prev_activations_sync()
+        fence_proxy_async_global()
+        warpgroup_sync()
 
         prev_stage = stage
         for s in cutlass.range_constexpr(nS - 1):

@@ -7,10 +7,11 @@ import cutlass
 import cutlass.cute as cute
 from cutlass.cute.nvgpu import cpasync, warp
 
-from operators.kernel_utils import (
+from megakernel.kernel_utils import (
     ld_acquire_u32,
     atomic_add_release,
     fence_proxy_async_global,
+    fence_proxy_async_shared_cta,
     WarpgroupMeta,
 )
 
@@ -211,6 +212,7 @@ class Matmul:
 
 
         cute.arch.mbarrier_wait(input_bar_me, input_mbar_phase)
+        fence_proxy_async_shared_cta()
         stage      = stage_cell[0]
         load_phase = phase_cell[0]
 
@@ -228,6 +230,7 @@ class Matmul:
         load_A(next_stage, 1)
 
         cute.arch.mbarrier_wait(compute_bar_me, compute_mbar_phase)
+        fence_proxy_async_shared_cta()
         prefetch_stage = (stage + 2) % nS
 
         for k_tile in cutlass.range(0, k_tiles - 2):
@@ -235,6 +238,7 @@ class Matmul:
             load_A(prefetch_stage, k_tile + 2)
             load_B(prefetch_stage, k_tile + 2)
             load_phase = wait_stage(stage, load_phase)
+            fence_proxy_async_shared_cta()
             gemm(stage)
 
             stage = (stage + 1) % nS
@@ -242,6 +246,7 @@ class Matmul:
 
         in_flight = (stage + 1) % nS
         load_phase = wait_stage(stage, load_phase)
+        fence_proxy_async_shared_cta()
         gemm(stage)
 
         if warpgroup.warp_id == 1:
@@ -253,6 +258,7 @@ class Matmul:
         stage = in_flight
 
         load_phase = wait_stage(stage, load_phase)
+        fence_proxy_async_shared_cta()
         gemm(stage)
 
         cute.arch.mbarrier_wait(output_bar_me, output_mbar_phase)
