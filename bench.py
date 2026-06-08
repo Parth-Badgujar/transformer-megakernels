@@ -7,10 +7,10 @@ import torch
 import argparse
 import cutlass.cute as cute
 from cutlass.cute.runtime import from_dlpack
-
-from src.megakernel.megakernel import LLMMegaKernel, LLMMegaKernelConfig
+import subprocess
+from megakernel import LLMMegaKernel, LLMMegaKernelConfig
 from scheduler import get_attn_schedule
-from src.megakernel.model import MultiLayerTransformer, extract_weights
+from megakernel.model import MultiLayerTransformer, extract_weights
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--n_iters", type = int, default = 100)
@@ -36,7 +36,7 @@ num_q_heads  = 4
 num_kv_heads = 4
 num_stages   = 3
 is_causal    = False
-num_layers   = 64
+num_layers   = 4
 ff_dim       = 512
 
 embed_dim  = num_q_heads * head_dim
@@ -67,7 +67,6 @@ cfg = LLMMegaKernelConfig(
     is_causal    = is_causal,
     num_stages   = num_stages,
     bR                 = 4,
-    num_stages_rms     = 3,
     rows_per_rms_block = rows_per_rms_block,
     use_tma_reduce = False,
     output_pad = 0
@@ -82,7 +81,7 @@ model = MultiLayerTransformer(
     embed_dim, num_q_heads, num_kv_heads, ff_dim, num_layers, is_causal=is_causal
 ).cuda()
 model.eval()
-# model_f32 = model.to(torch.float32)
+
 model_f32 = MultiLayerTransformer(
     embed_dim, num_q_heads, num_kv_heads, ff_dim, num_layers, is_causal=is_causal, dtype = torch.float32
 ).cuda()
@@ -130,8 +129,8 @@ for i in range(num_rounds):
 cEmbedding = from_dlpack(embedding, assumed_align = 16)
 
 kernel = LLMMegaKernel(cfg)
-os.system("rm *.ptx")
-os.system("rm *.cubin")
+subprocess.run(["rm", "*.ptx"])
+subprocess.run(["rm", "*.cubin"])
 ref = model(sample_input)
 ref_f32 = model_f32(sample_input_f32)
 print("[compile] starting", flush=True)
@@ -145,9 +144,9 @@ print(f"[compile] done in {time.time() - t0:.2f}s", flush=True)
 
 
 if os.path.exists("/opt/watchdog/users/parth/cuda13.2/bin/ptxas"):
-    os.system("/opt/watchdog/users/parth/cuda13.2/bin/ptxas --gpu-name sm_120a --output-file megakernel.cubin --verbose cutlass*.ptx")
+    subprocess.run(["/opt/watchdog/users/parth/cuda13.2/bin/ptxas", "--gpu-name", "sm_120a", "--output-file", "megakernel.cubin", "--verbose", "cutlass*.ptx"])
 else:
-    os.system("ptxas --gpu-name sm_120a --output-file megakernel.cubin --verbose cutlass*.ptx")
+    subprocess.run(["ptxas", "--gpu-name", "sm_120a", "--output-file", "megakernel.cubin", "--verbose", "cutlass*.ptx"])
 
 max_errs = []
 mean_errs = []
@@ -188,7 +187,7 @@ import matplotlib.pyplot as plt
 arr = np.array(max_errs)
 np.save("max_errs.npy", arr)
 fig = plt.figure()
-_, _, patches  =plt.hist(arr)
+_, _, patches = plt.hist(arr)
 plt.bar_label(patches)
 plt.savefig("max_errs.png")
 

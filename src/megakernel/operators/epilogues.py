@@ -15,7 +15,7 @@ take it with a bN box and squeeze, the store takes it with bN+PAD.
 import cutlass
 import cutlass.cute as cute
 
-from operators.kernel_utils import fence_proxy_async_shared_cta
+from megakernel.kernel_utils import fence_proxy_async_shared_cta
 
 
 @cute.jit
@@ -53,7 +53,7 @@ def residual_add_store(*, thr_mma, tCrC, sC, warpgroup,
 
 @cute.jit
 def silu_mul(*, thr_mma, tCrC, sC, warpgroup,
-             gC, gC_tma=None, pid_m, pid_n, bM, bN, **_):
+             gC, gC_tma = None, pid_m, pid_n, bM, bN, **_):
     tCsC    = thr_mma.partition_C(sC)
     gC_tile = cute.local_tile(gC, (bM, bN), (pid_m, pid_n))
     tCgC    = thr_mma.partition_C(gC_tile)
