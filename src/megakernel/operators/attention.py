@@ -118,6 +118,7 @@ class Attention:
             ready = cutlass.Int32(0)
             while ready != pipeline.expected_cnt:
                 ready = ld_acquire_u32((mAtomics.iterator + pipeline.current_idx).toint()) #ty: ignore
+        fence_proxy_async_global()
         warpgroup_sync()
 
         smem_k_block = 64 if d % 64 == 0 else 32

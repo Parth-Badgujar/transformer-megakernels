@@ -83,12 +83,14 @@ class Matmul:
         cute.arch.barrier(barrier_id=8 + group_id, number_of_threads = 128)
 
     @cute.jit
-    def _wait_prev(self, *, expected_cnt, mAtomics, atomic_idx, warp_id):
+    def _wait_prev(self, *, expected_cnt, mAtomics, atomic_idx, warp_id, group_id):
         if warp_id == 0:
             with cute.arch.elect_one():
                 ready = cutlass.Int32(0)
                 while ready != expected_cnt:
                     ready = ld_acquire_u32((mAtomics.iterator + atomic_idx).toint())
+        cute.arch.barrier(barrier_id=8 + group_id, number_of_threads=128)
+        fence_proxy_async_global()
 
     @cute.jit
     def _wait_stage(self, stage_idx, load_phase, *, load_bar):
@@ -212,7 +214,8 @@ class Matmul:
         wait_prev = partial(
             self._wait_prev,
             expected_cnt = pipeline.expected_cnt, mAtomics = mAtomics,
-            atomic_idx = pipeline.current_idx, warp_id = warpgroup.warp_id
+            atomic_idx = pipeline.current_idx, warp_id = warpgroup.warp_id,
+            group_id = warpgroup.group_id
         )
         wait_stage = partial(self._wait_stage, load_bar = load_bar)
 

@@ -120,7 +120,7 @@ cUp_w      = from_dlpack(up_w,      assumed_align = 16)
 cDown_w    = from_dlpack(down_w,    assumed_align = 16)
 cOut_w     = from_dlpack(out_w,     assumed_align = 16)
 embeddings_arr = []
-num_rounds = 1
+num_rounds = 1000
 for i in range(num_rounds):
     embeddings_arr.append(embedding.clone())
 c_embedding_arr = []
@@ -156,9 +156,9 @@ for i in range(num_rounds):
     compiled(cSchedule, cAtomics, cRms_w, cQkv_w, cWs1, cWs2,
             cGate_w, cUp_w, cDown_w, cOut_w, c_embedding_arr[i])
     torch.cuda.synchronize()
-    torch.save(ref, f"ref_v{i}.pt")
+    # torch.save(ref, f"ref_v{i}.pt")
     embeddings_arr[i] = embeddings_arr[i].view(batch_size, seq_len, -1)
-    torch.save(embeddings_arr[i], f"out_v{i}.pt")
+    # torch.save(embeddings_arr[i], f"out_v{i}.pt")
     diff     = (embeddings_arr[i].float() - ref.float()).abs()
     diff_f32_out = (embeddings_arr[i].float() - ref_f32.float()).abs()
     diff_f32_ref = (ref.float() - ref_f32.float()).abs()
