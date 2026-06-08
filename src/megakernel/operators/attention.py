@@ -42,10 +42,14 @@ class Attention:
     def _reshape_acc_to_mn(acc):
         col_major = cute.make_layout(acc.layout.shape)
         mn_layout = cute.make_layout(
-            ((col_major.shape[0][1], col_major.shape[1]),
-             (col_major.shape[0][0], col_major.shape[2])),
-            stride=((col_major.stride[0][1], col_major.stride[1]),
-                    (col_major.stride[0][0], col_major.stride[2])),
+            shape = (
+                (col_major.shape[0][1], col_major.shape[1]),
+                (col_major.shape[0][0], col_major.shape[2])
+            ),
+            stride = (
+                (col_major.stride[0][1], col_major.stride[1]),
+                (col_major.stride[0][0], col_major.stride[2])
+            ),
         )
         return cute.make_tensor(acc.iterator, mn_layout)
 
@@ -54,8 +58,16 @@ class Attention:
     def _reshape_rP_to_mma_A(rP):
         divided = cute.logical_divide(rP.layout, (None, None, 2))
         mma_view = cute.make_layout(
-            ((divided.shape[0], divided.shape[2][0]), divided.shape[1], divided.shape[2][1]),
-            stride=((divided.stride[0], divided.stride[2][0]), divided.stride[1], divided.stride[2][1]),
+            shape = (
+                (divided.shape[0], divided.shape[2][0]),
+                divided.shape[1], 
+                divided.shape[2][1]
+            ),
+            stride = (
+                (divided.stride[0], divided.stride[2][0]),
+                divided.stride[1],
+                divided.stride[2][1]
+            )
         )
         return cute.make_tensor(rP.iterator, mma_view)
 

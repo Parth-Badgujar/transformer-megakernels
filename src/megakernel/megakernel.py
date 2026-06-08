@@ -159,22 +159,6 @@ class LLMMegaKernel:
     ):
         PAD = self.output_pad
 
-        mWS1_embed = cute.make_tensor(
-            mWorkspace1.iterator,
-            cute.make_ordered_layout(
-                shape = (self.num_tokens, self.embed_dim),
-                order = (1, 0)
-            )
-        )
-
-        mFF_hidden = cute.make_tensor(
-            mWorkspace2.iterator,
-            cute.make_ordered_layout(
-                shape = (self.num_tokens, self.ff_dim),
-                order = (1, 0)
-            )
-        )
-
         q_layout  = cute.make_layout(
             shape = (self.bs, self.num_q_heads,  self.q_len, self.head_dim),
             stride = (self.q_len * self.qkv_out_dim, self.head_dim, self.qkv_out_dim, 1)
@@ -204,25 +188,35 @@ class LLMMegaKernel:
                 order = (2, 1, 0)
             )
         )
+        mFF_hidden = cute.make_tensor(
+            mWorkspace2.iterator,
+            cute.make_ordered_layout(
+                shape = (self.num_tokens, self.ff_dim),
+                order = (1, 0)
+            )
+        )
         mFF_hidden_mm = cute.make_tensor(
             mWorkspace2.iterator, cute.make_ordered_layout(
                 shape = (self.num_tokens, self.ff_dim // self.bN, self.bN),
                 order = (2, 1, 0)
             )
         )
+        
         mEmbed_st    = cute.make_tensor(
             mEmbedding.iterator, cute.make_ordered_layout(
                 shape = (self.num_tokens, self.embed_dim // self.bN, self.bN),
                 order = (2, 1, 0)
             )
         )
-        mEmbed    = cute.make_tensor(
-            mEmbedding.iterator, cute.make_ordered_layout(
+
+        mWS1_embed = cute.make_tensor(
+            mWorkspace1.iterator,
+            cute.make_ordered_layout(
                 shape = (self.num_tokens, self.embed_dim),
                 order = (1, 0)
             )
         )
-
+        
         matmul_A_sw = cute.make_composed_layout(
             cute.make_swizzle(3, 4, 3), 0,
                 cute.make_ordered_layout(
@@ -280,7 +274,7 @@ class LLMMegaKernel:
         tma_OUT_inp, g_OUT_inp   = cpasync.make_tiled_tma_atom(load_op,      mWS1_embed,    matmul_A_sw,  (self.bM, self.bK))
         tma_OUT_wt,  g_OUT_wt    = cpasync.make_tiled_tma_atom(load_op,      mOutProjAttn,  matmul_B_sw,  (1, self.bN, self.bK))
         tma_OUT_out, g_OUT_out   = cpasync.make_tiled_tma_atom(store_op_red, mEmbed_st,       matmul_C_pad, (self.bM, 1, self.bN + PAD))
-        g_OUT_out_nt = mEmbed
+        g_OUT_out_nt = mEmbedding
         # UP Proj TMA Atoms (WS1 @ mUp_weights -> WS2)
         tma_UP_inp, g_UP_inp     = cpasync.make_tiled_tma_atom(load_op,      mWS1_embed,    matmul_A_sw,  (self.bM, self.bK))
         tma_UP_wt,  g_UP_wt      = cpasync.make_tiled_tma_atom(load_op,      mUp_proj,      matmul_B_sw,  (1, self.bN, self.bK))
@@ -291,10 +285,10 @@ class LLMMegaKernel:
         tma_GATE_out, g_GATE_out = cpasync.make_tiled_tma_atom(store_op,     mFF_hidden_mm, matmul_C_pad, (self.bM, 1, self.bN + PAD))
         g_GATE_gate = mFF_hidden # Non TMA
         # DOWN Proj TMA Atoms (WS1 @ mDown_weights -> += Embedding) (Reduction)
-        tma_DOWN_inp, g_DOWN_inp = cpasync.make_tiled_tma_atom(load_op,      mWS1_embed,   matmul_A_sw,  (self.bM, self.bK))
+        tma_DOWN_inp, g_DOWN_inp = cpasync.make_tiled_tma_atom(load_op,      mFF_hidden,   matmul_A_sw,  (self.bM, self.bK))
         tma_DOWN_wt,  g_DOWN_wt  = cpasync.make_tiled_tma_atom(load_op,      mDown_proj,   matmul_B_sw,  (1, self.bN, self.bK))
         tma_DOWN_out, g_DOWN_out = cpasync.make_tiled_tma_atom(store_op_red, mEmbed_st,      matmul_C_pad, (self.bM, 1, self.bN + PAD))
-        g_DOWN_out_nt = mEmbed
+        g_DOWN_out_nt = mEmbedding
 
         self.rmsnorm = RMSNorm(self.rms_config)
         self.qkv     = Matmul(self.matmul_config, basic_store)
@@ -334,8 +328,8 @@ class LLMMegaKernel:
         g_QKV_inp: cute.Tensor, g_QKV_act: cute.Tensor, g_QKV_wt: cute.Tensor,
         g_OUT_inp: cute.Tensor, g_OUT_out: cute.Tensor, g_OUT_wt: cute.Tensor, g_OUT_out_nt: cute.Tensor,
         g_UP_inp: cute.Tensor, g_UP_out: cute.Tensor, g_UP_wt: cute.Tensor,
-        g_DOWN_inp: cute.Tensor, g_DOWN_out: cute.Tensor, g_DOWN_wt: cute.Tensor, g_DOWN_out_nt: cute.Tensor,
         g_GATE_inp: cute.Tensor, g_GATE_out: cute.Tensor, g_GATE_wt: cute.Tensor, g_GATE_gate: cute.Tensor,
+        g_DOWN_inp: cute.Tensor, g_DOWN_out: cute.Tensor, g_DOWN_wt: cute.Tensor, g_DOWN_out_nt: cute.Tensor,
         tma_RMS_inp: cute.CopyAtom,  tma_RMS_out: cute.CopyAtom,  tma_RMS_wt: cute.CopyAtom,
         tma_QKV_inp: cute.CopyAtom,  tma_QKV_act: cute.CopyAtom,  tma_QKV_wt: cute.CopyAtom,
         tma_OUT_inp: cute.CopyAtom,  tma_OUT_out: cute.CopyAtom,  tma_OUT_wt: cute.CopyAtom,

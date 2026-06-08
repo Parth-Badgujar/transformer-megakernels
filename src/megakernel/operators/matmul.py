@@ -264,7 +264,7 @@ class Matmul:
         gemm(stage)
 
         cute.arch.mbarrier_wait(output_bar_me, phases.output_phase)
-        thr_mma_epi = tiled_mma.get_slice(warpgroup.tidx)
+        thr_mma_epi = tiled_mma.get_slice(warpgroup.group_tidx)
         self.epilogue(
             thr_mma = thr_mma_epi, 
             tCrC = tCrC, sC = sC,

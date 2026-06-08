@@ -15,7 +15,7 @@ take it with a bN box and squeeze, the store takes it with bN+PAD.
 import cutlass
 import cutlass.cute as cute
 
-from megakernel.kernel_utils import fence_proxy_async_shared_cta
+from megakernel.kernel_utils import fence_proxy_async_shared_cta, fence_proxy_async_global
 
 
 @cute.jit
@@ -25,7 +25,7 @@ def basic_store(*, thr_mma, tCrC, sC, warpgroup, **_):
     tCrD.store(tCrC.load().to(cutlass.BFloat16))
     cute.autovec_copy(tCrD, tCsC)
     fence_proxy_async_shared_cta()
-    cute.arch.barrier(barrier_id=8 + warpgroup.group_id, number_of_threads=128)
+    cute.arch.barrier(barrier_id = 8 + warpgroup.group_id, number_of_threads = 128)
 
 
 
@@ -33,6 +33,7 @@ def basic_store(*, thr_mma, tCrC, sC, warpgroup, **_):
 def residual_add_store(*, thr_mma, tCrC, sC, warpgroup,
                        gC, gC_tma=None, pid_m, pid_n, bM, bN, use_tma_reduce, **_):
     tCsC = thr_mma.partition_C(sC)
+    fence_proxy_async_global()
     if cutlass.const_expr(use_tma_reduce):
         tCrD = cute.make_fragment_like(tCrC, cutlass.BFloat16)
         tCrD.store(tCrC.load().to(cutlass.BFloat16))
@@ -47,7 +48,7 @@ def residual_add_store(*, thr_mma, tCrC, sC, warpgroup,
         tCrD.store(sum_f32.to(cutlass.BFloat16))
         cute.autovec_copy(tCrD, tCsC)
     fence_proxy_async_shared_cta()
-    cute.arch.barrier(barrier_id=8 + warpgroup.group_id, number_of_threads=128)
+    cute.arch.barrier(barrier_id = 8 + warpgroup.group_id, number_of_threads = 128)
 
 
 
@@ -57,7 +58,7 @@ def silu_mul(*, thr_mma, tCrC, sC, warpgroup,
     tCsC    = thr_mma.partition_C(sC)
     gC_tile = cute.local_tile(gC, (bM, bN), (pid_m, pid_n))
     tCgC    = thr_mma.partition_C(gC_tile)
-
+    fence_proxy_async_global()
     gate = tCrC.load()
     silu = gate  / (cutlass.Float32(1.0) + cute.math.exp(-gate, fastmath=True))
     rUp = cute.make_fragment_like(tCrC, cutlass.BFloat16)
@@ -67,4 +68,4 @@ def silu_mul(*, thr_mma, tCrC, sC, warpgroup,
     tCrD.store(prod_f32.to(cutlass.BFloat16))
     cute.autovec_copy(tCrD, tCsC)
     fence_proxy_async_shared_cta()
-    cute.arch.barrier(barrier_id=8 + warpgroup.group_id, number_of_threads=128)
+    cute.arch.barrier(barrier_id = 8 + warpgroup.group_id, number_of_threads = 128)
