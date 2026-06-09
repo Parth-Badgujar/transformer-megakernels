@@ -303,12 +303,15 @@ if __name__ == "__main__":
         block_rms=1,
         block_q=64,
         block_kv=64,
-        bM=64,
+        num_stages=2,
+        bM=128,
         bN=128,
-        bK=128,
+        bK=64,
         bs=16,
         num_sms=188,
-        rows_per_rms_block=int(sys.argv[1]) if len(sys.argv) > 1 else 64,
+        output_pad=8,
+        warps_per_row=1,
+        rows_per_rms_block=int(sys.argv[1]) if len(sys.argv) > 1 else 32,
     )
 
     scheduler = OpScheduler(cfg)

@@ -1,4 +1,3 @@
-
 import os
 os.environ["CUTE_DSL_LINEINFO"] = "1"
 
@@ -18,6 +17,27 @@ from megakernel.kernel_utils import WarpgroupMeta, Phases, PipelineMeta
 from cutlass import Int32, BFloat16, Uint64
 
 
+# =============================================================================
+# V2 NOTES
+# -----------------------------------------------------------------------------
+# Two-stage architecture.  SMEM (99 KiB budget on sm120) is carved into three
+# sections plus barriers:
+#       stage 0  : 32 KiB   (stages region, slot 0)
+#       stage 1  : 32 KiB   (stages region, slot 1)
+#       output   : 34 KiB   (bM*(bN+PAD) = 128*136*2, PAD=8)
+#       barriers : ~104 B
+#   total ~= 98.1 KiB, ~920 B headroom.
+#
+# * num_stages = 2, bM = bN = 128, bK = 64, output_pad = 8.
+# * RMS weights are loaded gmem -> rmem directly inside the op, so there is NO
+#   sW shared region and NO RMS-weight TMA atom; mRMS_weights is passed straight
+#   through as a global tensor.  (Per V1 convention, pid_n is passed in the
+#   `weight_reuse` slot; V2 RMS ignores it and always reloads to registers.)
+# * stage_elems is shared by all ops: matmul A+B (=(bM+bN)*bK), attention K+V
+#   (=2*bKV*head_dim), rms num_sets*E -- the max is (bM+bN)*bK = 16384 bf16.
+# =============================================================================
+
+
 @dataclass
 class LLMMegaKernelConfig:
     embed_dim:          int
@@ -30,18 +50,18 @@ class LLMMegaKernelConfig:
     block_rms:          int
     block_q:            int
     block_kv:           int
-    num_stages:         int  = 3
-    bM:                 int  = 64
-    bN:                 int  = 128
+    num_stages:         int  = 2          # V2: two-stage
+    bM:                 int  = 128        # V2: larger M tile
+    bN:                 int  = 64
     bK:                 int  = 64
     bs:                 int  = 8
     num_sms:            int  = 188
     is_causal:          bool = False
     use_tma_reduce:     bool = False
-    output_pad:         int  = 16
-    bR:                 int  = 4
+    output_pad:         int  = 8          # V2: 8 so 128*(128+8)*2 = 34 KiB fits
+    warps_per_row:      int  = 1          # V2: replaces bR; num_sets = 4//warps_per_row
     rows_per_rms_block: int  = 32
-    max_works:          int  = 0   # filled in after scheduling
+    max_works:          int  = 0          # filled in after scheduling
 
 
 class Op(IntEnum):
@@ -72,23 +92,30 @@ class LLMMegaKernel:
         self.bs           = config.bs
         self.num_sms      = config.num_sms
         self.max_works    = config.max_works
-        self.bR           = config.bR
+        self.warps_per_row = config.warps_per_row
+        self.num_sets      = 4 // self.warps_per_row
         self.rows_per_rms_block = config.rows_per_rms_block
-        self.qkv_out_dim = (self.num_q_heads + 2 * self.num_kv_heads) * self.head_dim
-        self.num_tokens    = self.bs * self.q_len
+        self.qkv_out_dim  = (self.num_q_heads + 2 * self.num_kv_heads) * self.head_dim
+        self.num_tokens   = self.bs * self.q_len
         self.bQ           = config.block_q
         self.bKV          = config.block_kv
         self.use_tma_reduce = config.use_tma_reduce
         self.output_pad     = config.output_pad
-        self.stage_elements = max(self.bM * self.bK + self.bN * self.bK, self.bR * self.embed_dim)
+
+        # one stage section must hold the largest of: matmul A+B, attn K+V, rms set
+        self.stage_elements = max(
+            self.bM * self.bK + self.bN * self.bK,
+            2 * self.bKV * self.head_dim,
+            self.num_sets * self.embed_dim,
+        )
 
         self.rms_config = RMSNormConfig(
-            bR = self.bR,
-            bM = self.bM,
-            embed_dim = self.embed_dim,
-            num_stages = self.num_stages,
+            embed_dim          = self.embed_dim,
+            num_stages         = self.num_stages,
             rows_per_rms_block = self.rows_per_rms_block,
-            stage_elems = self.stage_elements
+            bM                 = self.bM,
+            stage_elems        = self.stage_elements,
+            warps_per_row      = self.warps_per_row,
         )
 
         self.matmul_config = MatmulConfig(
@@ -117,26 +144,24 @@ class LLMMegaKernel:
 
     @cute.jit
     def _get_shared_storage(self):
-        num_out_elements   = max(
+        num_out_elements = max(
             self.bM * (self.bN + self.output_pad),
             self.bQ * (self.head_dim + self.output_pad),
-            self.bR * self.embed_dim * self.num_stages
+            self.num_sets * self.embed_dim * self.num_stages,
         )
 
         @cute.struct
         class BarrierStorage:
             load_barrier:    cute.struct.MemRange[Uint64, self.num_stages]
-            pp_barrier:      cute.struct.MemRange[Uint64, 2]
             input_barrier:   cute.struct.MemRange[Uint64, 2]
             output_barrier:  cute.struct.MemRange[Uint64, 2]
             compute_barrier: cute.struct.MemRange[Uint64, 2]
-            stage: cute.struct.MemRange[Int32, 1]
-            phase: cute.struct.MemRange[Int32, 1]
+            stage:           cute.struct.MemRange[Int32, 1]
+            phase:           cute.struct.MemRange[Int32, 1]
 
         @cute.struct
         class SharedStorage:
-            barriers: BarrierStorage # ty: ignore
-            sW:     cute.struct.Align[cute.struct.MemRange[BFloat16, 2 * self.embed_dim], 128]
+            barriers: BarrierStorage 
             stages: cute.struct.Align[cute.struct.MemRange[BFloat16, self.num_stages * self.stage_elements], 128]
             out:    cute.struct.Align[cute.struct.MemRange[BFloat16, num_out_elements], 128]
 
@@ -160,12 +185,12 @@ class LLMMegaKernel:
         PAD = self.output_pad
 
         q_layout  = cute.make_layout(
-            shape = (self.bs, self.num_q_heads,  self.q_len, self.head_dim),
-            stride = (self.q_len * self.qkv_out_dim, self.head_dim, self.qkv_out_dim, 1)
+            shape  = (self.bs, self.num_q_heads,  self.q_len, self.head_dim),
+            stride = (self.q_len * self.qkv_out_dim, self.head_dim, self.qkv_out_dim, 1),
         )
         kv_layout = cute.make_layout(
-            shape = (self.bs, self.num_kv_heads, self.kv_len, self.head_dim),
-            stride = (self.kv_len * self.qkv_out_dim, self.head_dim, self.qkv_out_dim, 1)
+            shape  = (self.bs, self.num_kv_heads, self.kv_len, self.head_dim),
+            stride = (self.kv_len * self.qkv_out_dim, self.head_dim, self.qkv_out_dim, 1),
         )
 
         k_off = self.num_q_heads * self.head_dim
@@ -173,82 +198,63 @@ class LLMMegaKernel:
 
         # QKV Split Layout
         mQ = cute.make_tensor(mWorkspace2.iterator,         q_layout)
-        mK = cute.make_tensor(mWorkspace2.iterator + k_off, kv_layout) #ty: ignore
-        mV = cute.make_tensor(mWorkspace2.iterator + v_off, kv_layout) #ty: ignore
+        mK = cute.make_tensor(mWorkspace2.iterator + k_off, kv_layout) 
+        mV = cute.make_tensor(mWorkspace2.iterator + v_off, kv_layout) 
 
         mAttn_out = cute.make_tensor(
             mWorkspace1.iterator, cute.make_ordered_layout(
-                shape = (self.bs, self.num_q_heads, self.q_len, self.head_dim),
-                order = (3, 1, 2, 0)
+                shape=(self.bs, self.num_q_heads, self.q_len, self.head_dim),
+                order=(3, 1, 2, 0),
             )
         )
         mQKV_act = cute.make_tensor(
             mWorkspace2.iterator, cute.make_ordered_layout(
-                shape = (self.num_tokens, self.qkv_out_dim // self.bN, self.bN),
-                order = (2, 1, 0)
+                shape=(self.num_tokens, self.qkv_out_dim // self.bN, self.bN),
+                order=(2, 1, 0),
             )
         )
         mFF_hidden = cute.make_tensor(
             mWorkspace2.iterator,
-            cute.make_ordered_layout(
-                shape = (self.num_tokens, self.ff_dim),
-                order = (1, 0)
-            )
+            cute.make_ordered_layout(shape=(self.num_tokens, self.ff_dim), order=(1, 0)),
         )
         mFF_hidden_mm = cute.make_tensor(
             mWorkspace2.iterator, cute.make_ordered_layout(
-                shape = (self.num_tokens, self.ff_dim // self.bN, self.bN),
-                order = (2, 1, 0)
-            )
-        )
-        
-        mEmbed_st    = cute.make_tensor(
-            mEmbedding.iterator, cute.make_ordered_layout(
-                shape = (self.num_tokens, self.embed_dim // self.bN, self.bN),
-                order = (2, 1, 0)
+                shape=(self.num_tokens, self.ff_dim // self.bN, self.bN),
+                order=(2, 1, 0),
             )
         )
 
-        mWS1_embed = cute.make_tensor(
-            mWorkspace1.iterator,
-            cute.make_ordered_layout(
-                shape = (self.num_tokens, self.embed_dim),
-                order = (1, 0)
+        mEmbed_st = cute.make_tensor(
+            mEmbedding.iterator, cute.make_ordered_layout(
+                shape=(self.num_tokens, self.embed_dim // self.bN, self.bN),
+                order=(2, 1, 0),
             )
         )
-        
+        mWS1_embed = cute.make_tensor(
+            mWorkspace1.iterator,
+            cute.make_ordered_layout(shape=(self.num_tokens, self.embed_dim), order=(1, 0)),
+        )
+
         matmul_A_sw = cute.make_composed_layout(
             cute.make_swizzle(3, 4, 3), 0,
-                cute.make_ordered_layout(
-                    shape = (self.bM, self.bK),
-                    order = (1, 0)
-                )
+            cute.make_ordered_layout(shape=(self.bM, self.bK), order=(1, 0)),
         )
         matmul_B_sw = cute.make_composed_layout(
             cute.make_swizzle(3, 4, 3), 0,
-                cute.make_ordered_layout(
-                    shape = (1, self.bN, self.bK),
-                    order = (2, 1, 0)
-                )
+            cute.make_ordered_layout(shape=(1, self.bN, self.bK), order=(2, 1, 0)),
         )
         matmul_C_pad = cute.make_ordered_layout(
-            shape = (self.bM, 1, self.bN + PAD),
-            order = (2, 1, 0)
-        )
-        
-        embed_wt  = cute.make_ordered_layout(
-            shape = (1, self.embed_dim),
-            order = (1, 0)
-        )
-        embed_act = cute.make_ordered_layout(
-            shape = (self.bR, self.embed_dim),
-            order = (1, 0)
+            shape=(self.bM, 1, self.bN + PAD), order=(2, 1, 0),
         )
 
-        attn_out = cute.make_ordered_layout(
-            shape = (1, 1, self.bQ, self.head_dim + PAD),
-            order = (3, 2, 1, 0)
+        # RMS activations are tiled by num_sets rows (V2: bR replaced by num_sets)
+        embed_act = cute.make_ordered_layout(
+            shape=(self.num_sets, self.embed_dim), order=(1, 0),
         )
+        attn_out = cute.make_ordered_layout(
+            shape=(1, 1, self.bQ, self.head_dim + PAD), order=(3, 2, 1, 0),
+        )
+
         '''
         TMA Atoms Naming Convention
         g_<Op>_<Tensor Name>
@@ -260,34 +266,35 @@ class LLMMegaKernel:
             store_op_red = cpasync.CopyReduceBulkTensorTileS2GOp(cute.ReductionKind.ADD)
         else:
             store_op_red = store_op
-        # RMS TMA Atoms (Embedding @ mRMS_weights -> WS1)
-        tma_RMS_inp, g_RMS_inp   = cpasync.make_tiled_tma_atom(load_op,      mEmbedding,    embed_act,    (self.bR, self.embed_dim))
-        tma_RMS_wt,  g_RMS_wt    = cpasync.make_tiled_tma_atom(load_op,      mRMS_weights,  embed_wt,     (1, self.embed_dim))
-        tma_RMS_out, g_RMS_out   = cpasync.make_tiled_tma_atom(store_op,     mWS1_embed,    embed_act,    (self.bR, self.embed_dim))
+
+        # RMS TMA Atoms (Embedding -> WS1).  NO weight TMA in V2: weights load
+        # gmem->rmem inside the op, mRMS_weights is passed through directly.
+        tma_RMS_inp, g_RMS_inp   = cpasync.make_tiled_tma_atom(load_op,  mEmbedding, embed_act, (self.num_sets, self.embed_dim))
+        tma_RMS_out, g_RMS_out   = cpasync.make_tiled_tma_atom(store_op, mWS1_embed, embed_act, (self.num_sets, self.embed_dim))
         # Attn Out Store (MHA Output -> WS1)
-        tma_ATTN_out, g_ATTN_out = cpasync.make_tiled_tma_atom(store_op,     mAttn_out,     attn_out,     (1, 1, self.bQ, self.head_dim + PAD))
-        # QKV TMA Atoms (WS1 @ mQKV_Weights -> WS2)
-        tma_QKV_inp, g_QKV_inp   = cpasync.make_tiled_tma_atom(load_op,      mWS1_embed,    matmul_A_sw,  (self.bM, self.bK))
-        tma_QKV_wt,  g_QKV_wt    = cpasync.make_tiled_tma_atom(load_op,      mQKV_proj,     matmul_B_sw,  (1, self.bN, self.bK))
-        tma_QKV_act, g_QKV_act   = cpasync.make_tiled_tma_atom(store_op,     mQKV_act,      matmul_C_pad, (self.bM, 1, self.bN + PAD))
-        # OUT Proj TMA Atoms (WS1 @ mOut_weights -> += Embedding) (Reduction)
-        tma_OUT_inp, g_OUT_inp   = cpasync.make_tiled_tma_atom(load_op,      mWS1_embed,    matmul_A_sw,  (self.bM, self.bK))
-        tma_OUT_wt,  g_OUT_wt    = cpasync.make_tiled_tma_atom(load_op,      mOutProjAttn,  matmul_B_sw,  (1, self.bN, self.bK))
-        tma_OUT_out, g_OUT_out   = cpasync.make_tiled_tma_atom(store_op_red, mEmbed_st,       matmul_C_pad, (self.bM, 1, self.bN + PAD))
+        tma_ATTN_out, g_ATTN_out = cpasync.make_tiled_tma_atom(store_op, mAttn_out, attn_out, (1, 1, self.bQ, self.head_dim + PAD))
+        # QKV (WS1 @ QKV_w -> WS2)
+        tma_QKV_inp, g_QKV_inp   = cpasync.make_tiled_tma_atom(load_op,  mWS1_embed, matmul_A_sw,  (self.bM, self.bK))
+        tma_QKV_wt,  g_QKV_wt    = cpasync.make_tiled_tma_atom(load_op,  mQKV_proj,  matmul_B_sw,  (1, self.bN, self.bK))
+        tma_QKV_act, g_QKV_act   = cpasync.make_tiled_tma_atom(store_op, mQKV_act,   matmul_C_pad, (self.bM, 1, self.bN + PAD))
+        # OUT Proj (WS1 @ Out_w -> += Embedding)
+        tma_OUT_inp, g_OUT_inp   = cpasync.make_tiled_tma_atom(load_op,      mWS1_embed,   matmul_A_sw,  (self.bM, self.bK))
+        tma_OUT_wt,  g_OUT_wt    = cpasync.make_tiled_tma_atom(load_op,      mOutProjAttn, matmul_B_sw,  (1, self.bN, self.bK))
+        tma_OUT_out, g_OUT_out   = cpasync.make_tiled_tma_atom(store_op_red, mEmbed_st,    matmul_C_pad, (self.bM, 1, self.bN + PAD))
         g_OUT_out_nt = mEmbedding
-        # UP Proj TMA Atoms (WS1 @ mUp_weights -> WS2)
-        tma_UP_inp, g_UP_inp     = cpasync.make_tiled_tma_atom(load_op,      mWS1_embed,    matmul_A_sw,  (self.bM, self.bK))
-        tma_UP_wt,  g_UP_wt      = cpasync.make_tiled_tma_atom(load_op,      mUp_proj,      matmul_B_sw,  (1, self.bN, self.bK))
-        tma_UP_out, g_UP_out     = cpasync.make_tiled_tma_atom(store_op,     mFF_hidden_mm, matmul_C_pad, (self.bM, 1, self.bN + PAD))
-        # GATE Proj TMA AToms (WS1 @ mGate_weights -> (WS2 * Silu(WS1)) -> WS2) (Non TMA multiplication reduction)
-        tma_GATE_inp, g_GATE_inp = cpasync.make_tiled_tma_atom(load_op,      mWS1_embed,    matmul_A_sw,  (self.bM, self.bK))
-        tma_GATE_wt,  g_GATE_wt  = cpasync.make_tiled_tma_atom(load_op,      mGate_proj,    matmul_B_sw,  (1, self.bN, self.bK))
-        tma_GATE_out, g_GATE_out = cpasync.make_tiled_tma_atom(store_op,     mFF_hidden_mm, matmul_C_pad, (self.bM, 1, self.bN + PAD))
-        g_GATE_gate = mFF_hidden # Non TMA
-        # DOWN Proj TMA Atoms (WS1 @ mDown_weights -> += Embedding) (Reduction)
-        tma_DOWN_inp, g_DOWN_inp = cpasync.make_tiled_tma_atom(load_op,      mFF_hidden,   matmul_A_sw,  (self.bM, self.bK))
-        tma_DOWN_wt,  g_DOWN_wt  = cpasync.make_tiled_tma_atom(load_op,      mDown_proj,   matmul_B_sw,  (1, self.bN, self.bK))
-        tma_DOWN_out, g_DOWN_out = cpasync.make_tiled_tma_atom(store_op_red, mEmbed_st,      matmul_C_pad, (self.bM, 1, self.bN + PAD))
+        # UP (WS1 @ Up_w -> WS2)
+        tma_UP_inp, g_UP_inp     = cpasync.make_tiled_tma_atom(load_op,  mWS1_embed,    matmul_A_sw,  (self.bM, self.bK))
+        tma_UP_wt,  g_UP_wt      = cpasync.make_tiled_tma_atom(load_op,  mUp_proj,      matmul_B_sw,  (1, self.bN, self.bK))
+        tma_UP_out, g_UP_out     = cpasync.make_tiled_tma_atom(store_op, mFF_hidden_mm, matmul_C_pad, (self.bM, 1, self.bN + PAD))
+        # GATE (WS1 @ Gate_w -> SiLU * UP -> WS2)
+        tma_GATE_inp, g_GATE_inp = cpasync.make_tiled_tma_atom(load_op,  mWS1_embed,    matmul_A_sw,  (self.bM, self.bK))
+        tma_GATE_wt,  g_GATE_wt  = cpasync.make_tiled_tma_atom(load_op,  mGate_proj,    matmul_B_sw,  (1, self.bN, self.bK))
+        tma_GATE_out, g_GATE_out = cpasync.make_tiled_tma_atom(store_op, mFF_hidden_mm, matmul_C_pad, (self.bM, 1, self.bN + PAD))
+        g_GATE_gate = mFF_hidden  # Non TMA
+        # DOWN (FF @ Down_w -> += Embedding)
+        tma_DOWN_inp, g_DOWN_inp = cpasync.make_tiled_tma_atom(load_op,      mFF_hidden, matmul_A_sw,  (self.bM, self.bK))
+        tma_DOWN_wt,  g_DOWN_wt   = cpasync.make_tiled_tma_atom(load_op,     mDown_proj, matmul_B_sw,  (1, self.bN, self.bK))
+        tma_DOWN_out, g_DOWN_out = cpasync.make_tiled_tma_atom(store_op_red, mEmbed_st,  matmul_C_pad, (self.bM, 1, self.bN + PAD))
         g_DOWN_out_nt = mEmbedding
 
         self.rmsnorm = RMSNorm(self.rms_config)
@@ -300,14 +307,14 @@ class LLMMegaKernel:
 
         SharedStorage = self._get_shared_storage()
 
-        self.kernel(mSchedule, mAtomics, 
-                g_RMS_inp, g_RMS_out, g_RMS_wt,
+        self.kernel(mSchedule, mAtomics,
+                g_RMS_inp, g_RMS_out, mRMS_weights,
                 g_QKV_inp, g_QKV_act, g_QKV_wt,
                 g_OUT_inp, g_OUT_out, g_OUT_wt, g_OUT_out_nt,
                 g_UP_inp, g_UP_out, g_UP_wt,
                 g_GATE_inp, g_GATE_out, g_GATE_wt, g_GATE_gate,
                 g_DOWN_inp, g_DOWN_out, g_DOWN_wt, g_DOWN_out_nt,
-                tma_RMS_inp,  tma_RMS_out,  tma_RMS_wt,
+                tma_RMS_inp,  tma_RMS_out,
                 tma_QKV_inp,  tma_QKV_act,  tma_QKV_wt,
                 tma_OUT_inp,  tma_OUT_out,  tma_OUT_wt,
                 tma_UP_inp,   tma_UP_out,   tma_UP_wt,
@@ -324,19 +331,19 @@ class LLMMegaKernel:
     def kernel(self,
         mSchedule: cute.Tensor,
         mAtomics: cute.Tensor,
-        g_RMS_inp: cute.Tensor, g_RMS_out: cute.Tensor, g_RMS_wt: cute.Tensor,
+        g_RMS_inp: cute.Tensor, g_RMS_out: cute.Tensor, mRMS_weights: cute.Tensor,
         g_QKV_inp: cute.Tensor, g_QKV_act: cute.Tensor, g_QKV_wt: cute.Tensor,
         g_OUT_inp: cute.Tensor, g_OUT_out: cute.Tensor, g_OUT_wt: cute.Tensor, g_OUT_out_nt: cute.Tensor,
         g_UP_inp: cute.Tensor, g_UP_out: cute.Tensor, g_UP_wt: cute.Tensor,
         g_GATE_inp: cute.Tensor, g_GATE_out: cute.Tensor, g_GATE_wt: cute.Tensor, g_GATE_gate: cute.Tensor,
         g_DOWN_inp: cute.Tensor, g_DOWN_out: cute.Tensor, g_DOWN_wt: cute.Tensor, g_DOWN_out_nt: cute.Tensor,
-        tma_RMS_inp: cute.CopyAtom,  tma_RMS_out: cute.CopyAtom,  tma_RMS_wt: cute.CopyAtom,
+        tma_RMS_inp: cute.CopyAtom,  tma_RMS_out: cute.CopyAtom,
         tma_QKV_inp: cute.CopyAtom,  tma_QKV_act: cute.CopyAtom,  tma_QKV_wt: cute.CopyAtom,
         tma_OUT_inp: cute.CopyAtom,  tma_OUT_out: cute.CopyAtom,  tma_OUT_wt: cute.CopyAtom,
         tma_UP_inp: cute.CopyAtom,   tma_UP_out: cute.CopyAtom,   tma_UP_wt: cute.CopyAtom,
         tma_GATE_inp: cute.CopyAtom, tma_GATE_out: cute.CopyAtom, tma_GATE_wt: cute.CopyAtom,
         tma_DOWN_inp: cute.CopyAtom, tma_DOWN_out: cute.CopyAtom, tma_DOWN_wt: cute.CopyAtom,
-        mQ: cute.Tensor, mK: cute.Tensor, mV: cute.Tensor, 
+        mQ: cute.Tensor, mK: cute.Tensor, mV: cute.Tensor,
         tma_ATTN_out: cute.CopyAtom, g_ATTN_out: cute.Tensor,
         SharedStorage: cutlass.Constexpr
     ):
@@ -352,14 +359,12 @@ class LLMMegaKernel:
             group_tidx = group_tid,
             group_id   = group_id,
             lane_id    = tidx % 32,
-            warp_id    = local_warp
+            warp_id    = local_warp,
         )
 
-        # not sure if prefetching all helps
         if local_warp == 1:
             cpasync.prefetch_descriptor(tma_RMS_inp)
             cpasync.prefetch_descriptor(tma_RMS_out)
-            cpasync.prefetch_descriptor(tma_RMS_wt)
             cpasync.prefetch_descriptor(tma_QKV_inp)
             cpasync.prefetch_descriptor(tma_QKV_act)
             cpasync.prefetch_descriptor(tma_QKV_wt)
@@ -386,31 +391,25 @@ class LLMMegaKernel:
         load_stage       = storage.barriers.stage.get_tensor(cute.make_layout((1,)))
         load_phase_cell  = storage.barriers.phase.get_tensor(cute.make_layout((1,)))
 
-        # initialize mbarriers
         if warp_id == 0:
             with cute.arch.elect_one():
                 load_stage[0]      = 0
                 load_phase_cell[0] = 0
-                for i in cutlass.range_constexpr(self.num_stages): # ty: ignore
+                for i in cutlass.range_constexpr(self.num_stages): 
                     cute.arch.mbarrier_init(load_barriers + i, 1)
-                for i in cutlass.range_constexpr(2): #ty: ignore
-                    cute.arch.mbarrier_init(input_barriers + i  , 128)
-                    cute.arch.mbarrier_init(output_barriers + i , 128)
+                for i in cutlass.range_constexpr(2): 
+                    cute.arch.mbarrier_init(input_barriers + i,   128)
+                    cute.arch.mbarrier_init(output_barriers + i,  128)
                     cute.arch.mbarrier_init(compute_barriers + i, 128)
                 cute.arch.mbarrier_init_fence()
         cute.arch.sync_threads()
 
-        # arrive on warpgroup 0 barriers
         if group_id == 1:
             cute.arch.mbarrier_arrive(input_barriers + 0)
             cute.arch.mbarrier_arrive(compute_barriers + 0)
             cute.arch.mbarrier_arrive(output_barriers + 0)
 
-        phases = Phases(
-            compute_phase = 0,
-            input_phase = 0,
-            output_phase = 0
-        )
+        phases = Phases(compute_phase=0, input_phase=0, output_phase=0)
 
         max_works_local = (self.max_works + (1 - group_id)) // 2
 
@@ -425,23 +424,23 @@ class LLMMegaKernel:
             current_idx  = mSchedule[block_id, work_idx, 5]
             next_idx     = mSchedule[block_id, work_idx, 6]
 
-            op_kind   = op & 0x7 #ty: ignore
-            layer_idx = op >> 3 #ty: ignore
+            op_kind   = op & 0x7 
+            layer_idx = op >> 3  
 
             pipeline = PipelineMeta(
-                current_idx = current_idx,     # ty: ignore
-                expected_cnt = expected_cnt,   # ty: ignore
-                next_idx = next_idx            # ty: ignore
+                current_idx  = current_idx,  
+                expected_cnt = expected_cnt, 
+                next_idx     = next_idx,     
             )
 
             if op_kind == int(Op.RMS):
                 rms_w_idx = layer_idx * 2 + pid_o
                 self.rmsnorm.run(
-                    g_RMS_inp, g_RMS_out, g_RMS_wt,
-                    tma_RMS_inp, tma_RMS_out, tma_RMS_wt,
-                    rms_w_idx, pid_m, pid_n,
+                    g_RMS_inp, g_RMS_out, mRMS_weights,
+                    tma_RMS_inp, tma_RMS_out,
+                    rms_w_idx, pid_m, pid_n,           # pid_n occupies weight_reuse slot (ignored in V2)
                     mAtomics, pipeline, phases,
-                    warpgroup, storage
+                    warpgroup, storage,
                 )
             elif op_kind == int(Op.QKV):
                 self.qkv.run(
@@ -449,14 +448,14 @@ class LLMMegaKernel:
                     tma_QKV_inp, tma_QKV_wt, tma_QKV_act,
                     layer_idx, pid_m, pid_n,
                     mAtomics, pipeline, phases,
-                    warpgroup, storage
+                    warpgroup, storage,
                 )
             elif op_kind == int(Op.ATTN):
                 self.attn.run(
                     mQ, mK, mV, g_ATTN_out, tma_ATTN_out,
-                    pid_m, pid_n, pid_o, 
+                    pid_m, pid_n, pid_o,
                     mAtomics, pipeline, phases,
-                    warpgroup, storage
+                    warpgroup, storage,
                 )
             elif op_kind == int(Op.OUT):
                 self.out.run(
@@ -464,7 +463,7 @@ class LLMMegaKernel:
                     tma_OUT_inp, tma_OUT_wt, tma_OUT_out,
                     layer_idx, pid_m, pid_n,
                     mAtomics, pipeline, phases,
-                    warpgroup, storage
+                    warpgroup, storage,
                 )
             elif op_kind == int(Op.UP):
                 self.up.run(
@@ -472,7 +471,7 @@ class LLMMegaKernel:
                     tma_UP_inp, tma_UP_wt, tma_UP_out,
                     layer_idx, pid_m, pid_n,
                     mAtomics, pipeline, phases,
-                    warpgroup, storage
+                    warpgroup, storage,
                 )
             elif op_kind == int(Op.GATE):
                 self.gate.run(
@@ -480,7 +479,7 @@ class LLMMegaKernel:
                     tma_GATE_inp, tma_GATE_wt, tma_GATE_out,
                     layer_idx, pid_m, pid_n,
                     mAtomics, pipeline, phases,
-                    warpgroup, storage
+                    warpgroup, storage,
                 )
             elif op_kind == int(Op.DOWN):
                 self.down.run(
@@ -488,9 +487,9 @@ class LLMMegaKernel:
                     tma_DOWN_inp, tma_DOWN_wt, tma_DOWN_out,
                     layer_idx, pid_m, pid_n,
                     mAtomics, pipeline, phases,
-                    warpgroup, storage
+                    warpgroup, storage,
                 )
-  
+
             phases.compute_phase = phases.compute_phase ^ 1
             phases.input_phase   = phases.input_phase   ^ 1
             phases.output_phase  = phases.output_phase  ^ 1
