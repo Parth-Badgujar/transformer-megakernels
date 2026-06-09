@@ -255,9 +255,8 @@ class Matmul:
 
         # ---- epilogue into the output section, after the output barrier ----
         cute.arch.mbarrier_wait(output_bar_me, phases.output_phase)
-        thr_mma_epi = tiled_mma.get_slice(warpgroup.group_tidx)
         self.epilogue(
-            thr_mma=thr_mma_epi,
+            tiled_mma=tiled_mma,
             tCrC=tCrC, sC=sC,
             warpgroup=warpgroup,
             gC=gC, gC_tma=gC_tma,
