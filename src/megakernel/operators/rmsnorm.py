@@ -243,8 +243,6 @@ class RMSNorm:
             tXsO = thr.partition_S(sO[None, None, stage])
             rY   = cute.make_fragment_like(tXsO)
             rY.store(yv.to(BFloat16))
-            if is_last:
-                cute.arch.mbarrier_arrive(compute_bar_ot)
             cute.autovec_copy(rY, tXsO)
 
         cute.arch.mbarrier_wait(input_bar_me, phases.input_phase)
@@ -295,6 +293,7 @@ class RMSNorm:
         # ---- epilogue: last chunk (already prefetched), single compute, is_last ----
         wait_for_load_sync(prev_stage)
         rX = load_regs(prev_stage)
+        cute.arch.mbarrier_arrive(compute_bar_ot)
         compute_and_store(prev_stage, rX, is_last=True)
         store_outputs_async(prev_stage, chunks - 1)
  

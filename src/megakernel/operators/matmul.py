@@ -227,7 +227,6 @@ class Matmul:
         load_B(stage, 0)
         wait_prev()
         load_A(stage, 0)
-
         cute.arch.mbarrier_wait(compute_bar_me, phases.compute_phase)
 
         prefetch_stage = (stage + 1) % nS
