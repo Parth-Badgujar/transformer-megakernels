@@ -44,7 +44,7 @@ class OpScheduler:
                 return (i + 1) % self.num_sms
         return 0
 
-    def _compute_pid(self, block_id, total_pid, total_pid_m, group_size_m=4):
+    def _compute_pid(self, block_id, total_pid, total_pid_m, group_size_m = 8):
         total_pid_n = total_pid // total_pid_m
         gsm = min(group_size_m, total_pid_m)
         grp = gsm * total_pid_n

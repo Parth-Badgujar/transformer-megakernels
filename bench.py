@@ -8,7 +8,7 @@ import argparse
 import subprocess
 import cutlass.cute as cute
 from cutlass.cute.runtime import from_dlpack
-from scheduler import get_attn_schedule
+from megakernel.scheduler import get_attn_schedule
 from megakernel import LLMMegaKernel, LLMMegaKernelConfig
 from megakernel.model import MultiLayerTransformer, extract_weights
 
@@ -120,7 +120,7 @@ cUp_w      = from_dlpack(up_w,      assumed_align = 16)
 cDown_w    = from_dlpack(down_w,    assumed_align = 16)
 cOut_w     = from_dlpack(out_w,     assumed_align = 16)
 embeddings_arr = []
-num_rounds = 1000
+num_rounds = 1
 for i in range(num_rounds):
     embeddings_arr.append(embedding.clone())
 c_embedding_arr = []

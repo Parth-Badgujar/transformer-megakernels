@@ -48,15 +48,17 @@ class Matmul:
         return cute.make_tiled_mma(
             warp.MmaF16BF16Op(cutlass.BFloat16, cutlass.Float32, (16, 8, 16)),
             (2, 2, 1),
-            permutation_mnk = (self.config.bM, self.config.bN, self.config.bK),
+            permutation_mnk = (self.config.bM, self.config.bN, 64),
         )
 
     @cute.jit
     def _gemm(self, stage_idx, *, thr_copy_A, thr_copy_B, sA, sB, tiled_mma, tCrA, tCrB, tCrC):
         tCsA = thr_copy_A.partition_S(sA[None, None, stage_idx])
         tCsB = thr_copy_B.partition_S(sB[None, None, stage_idx])
-        cute.copy(thr_copy_A, tCsA, thr_copy_A.retile(tCrA))
-        cute.copy(thr_copy_B, tCsB, thr_copy_B.retile(tCrB))
+        tCrA_cpy = thr_copy_A.retile(tCrA)
+        tCrB_cpy = thr_copy_B.retile(tCrB)
+        cute.copy(thr_copy_A, tCsA, tCrA_cpy)
+        cute.copy(thr_copy_B, tCsB, tCrB_cpy)
         cute.gemm(tiled_mma, tCrC, tCrA, tCrB, tCrC)
 
     @cute.jit
