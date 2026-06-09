@@ -198,12 +198,13 @@ class RMSNorm:
 
         # ---- weights: gmem -> rmem direct, broadcast over the num_sets row-mode ----
         sW_bcast = cute.make_tensor(
-            (mWeight.iterator + rms_w_idx * E),                         # select row
+            (mWeight.iterator + rms_w_idx * E).align(128),                         # select row
             cute.make_layout((num_sets, E), stride=(0, 1)),
         )
         tWsW = thr.partition_S(sW_bcast)
         rW   = cute.make_fragment_like(tWsW)
-        cute.autovec_copy(tWsW, rW)
+        cute.copy(atom, tWsW, rW)
+        # cute.autovec_copy(tWsW, rW)
         wv = rW.load().to(Float32)
 
         @cute.jit
