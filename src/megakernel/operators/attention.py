@@ -241,9 +241,7 @@ class Attention:
         row_max.fill(-Float32.inf)
         row_sum.fill(Float32(0.0))
 
-        smem_store_bf = cute.make_copy_atom(
-            cute.nvgpu.CopyUniversalOp(), BFloat16, num_bits_per_copy=32,
-        )
+        smem_store_bf = cute.make_copy_atom(cute.nvgpu.warp.StMatrix8x8x16bOp(num_matrices = 4), BFloat16)
 
         cute.arch.mbarrier_wait(self.compute_bar_me, phases.compute_phase)
         fence_proxy_async_shared_cta()
