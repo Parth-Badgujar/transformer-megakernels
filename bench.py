@@ -12,9 +12,9 @@ import torch
 import cutlass.cute as cute
 from cutlass.cute.runtime import from_dlpack
 
-from megakernel.scheduler import get_attn_schedule
-from megakernel import LLMMegaKernel, LLMMegaKernelConfig
-from megakernel.model import MultiLayerTransformer, extract_weights
+from transformer_megakernel.scheduler import get_attn_schedule
+from transformer_megakernel import LLMMegaKernel, LLMMegaKernelConfig
+from transformer_megakernel.model import MultiLayerTransformer, extract_weights
 
 
 # -----------------------------------------------------------------------------
@@ -203,21 +203,21 @@ for i in range(num_rounds):
         max_err_f32_out = (out - ref_f32.float()).abs().max().item()
         max_err_f32_ref = (ref.float() - ref_f32.float()).abs().max().item()
         print("\nResults:")
-        print(f"  Max  abs error (bf16 ref vs f32 ref) : {max_err_f32_ref:.6f}")
-        print(f"  Max  abs error (bf16 out vs f32 ref) : {max_err_f32_out:.6f}")
-        print(f"  Max  abs error (bf16 out vs bf16 ref): {max_errs[0]:.6f}")
-        print(f"  Mean abs error    : {mean_errs[0]:.6f}")
-        print(f"  Mean rel error    : {rel_errs[0]:.6f}")
-        print(f"  Kernel output norm: {out.norm():.4f}")
-        print(f"  Ref bf16 norm     : {ref.float().norm():.4f}")
-        print(f"  Ref f32  norm     : {ref_f32.norm():.4f}\n")
+        print(f"  Max  abs error (bf16 ref vs f32 ref) : {max_err_f32_ref:.6f}", flush = True)
+        print(f"  Max  abs error (bf16 out vs f32 ref) : {max_err_f32_out:.6f}", flush = True)
+        print(f"  Max  abs error (bf16 out vs bf16 ref): {max_errs[0]:.6f}", flush = True)
+        print(f"  Mean abs error    : {mean_errs[0]:.6f}", flush = True)
+        print(f"  Mean rel error    : {rel_errs[0]:.6f}", flush = True)
+        print(f"  Kernel output norm: {out.norm():.4f}", flush = True)
+        print(f"  Ref bf16 norm     : {ref.float().norm():.4f}", flush = True)
+        print(f"  Ref f32  norm     : {ref_f32.norm():.4f}\n", flush = True)
 
-print("Max  (max errs):",  max(max_errs))
-print("Max  (mean errs):", max(mean_errs))
-print("Max  (rel errs):",  max(rel_errs))
-print("Min  (max errs):",  min(max_errs))
-print("Min  (mean errs):", min(mean_errs))
-print("Min  (rel errs):",  min(rel_errs))
+print("Max  (max errs):",  max(max_errs), flush = True)
+print("Max  (mean errs):", max(mean_errs), flush = True)
+print("Max  (rel errs):",  max(rel_errs), flush = True)
+print("Min  (max errs):",  min(max_errs), flush = True)
+print("Min  (mean errs):", min(mean_errs), flush = True)
+print("Min  (rel errs):",  min(rel_errs), flush = True)
 
 # histograms are only meaningful across many rounds
 if num_rounds > 1:

@@ -7,7 +7,7 @@ import cutlass
 import cutlass.cute as cute
 from cutlass.cute.nvgpu import cpasync, warp
 
-from megakernel.kernel_utils import (
+from transformer_megakernel.kernel_utils import (
     ld_acquire_u32,
     atomic_add_release,
     fence_proxy_async_global,
@@ -111,8 +111,6 @@ class Matmul:
                 ready = cutlass.Int32(0)
                 while ready != expected_cnt:
                     ready = ld_acquire_u32((mAtomics.iterator + atomic_idx).toint())
-        cute.arch.barrier(barrier_id=8 + group_id, number_of_threads=128)
-        fence_proxy_async_global()
 
     @cute.jit
     def _wait_stage(self, stage_idx, load_phase, *, load_bar):
@@ -226,6 +224,8 @@ class Matmul:
         expect_tx(stage)
         load_B(stage, 0)
         wait_prev()
+        fence_proxy_async_global()
+        warpgroup_sync()
         load_A(stage, 0)
         cute.arch.mbarrier_wait(compute_bar_me, phases.compute_phase)
 

@@ -15,7 +15,7 @@ take it with a bN box and squeeze, the store takes it with bN+PAD.
 import cutlass
 import cutlass.cute as cute
 
-from megakernel.kernel_utils import fence_proxy_async_shared_cta, fence_proxy_async_global
+from transformer_megakernel.kernel_utils import fence_proxy_async_shared_cta, fence_proxy_async_global
 
 
 @cute.jit

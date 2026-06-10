@@ -3,7 +3,7 @@ from collections import defaultdict
 
 import torch
 
-from megakernel import LLMMegaKernelConfig, Op
+from transformer_megakernel import LLMMegaKernelConfig, Op
 
 
 class OpScheduler:

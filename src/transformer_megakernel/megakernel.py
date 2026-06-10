@@ -9,11 +9,11 @@ import cutlass.cute as cute
 from cutlass.cute.nvgpu import cpasync
 from cutlass.utils import SmemAllocator
 
-from megakernel.operators.rmsnorm import RMSNorm, RMSNormConfig
-from megakernel.operators.matmul import Matmul, MatmulConfig
-from megakernel.operators.attention import Attention, AttentionConfig
-from megakernel.operators.epilogues import basic_store, residual_add_store, silu_mul
-from megakernel.kernel_utils import WarpgroupMeta, Phases, PipelineMeta
+from transformer_megakernel.operators.rmsnorm import RMSNorm, RMSNormConfig
+from transformer_megakernel.operators.matmul import Matmul, MatmulConfig
+from transformer_megakernel.operators.attention import Attention, AttentionConfig
+from transformer_megakernel.operators.epilogues import basic_store, residual_add_store, silu_mul
+from transformer_megakernel.kernel_utils import WarpgroupMeta, Phases, PipelineMeta
 from cutlass import Int32, BFloat16, Uint64
 
 

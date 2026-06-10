@@ -4,7 +4,7 @@ from cutlass.cute.nvgpu import cpasync
 from cutlass import BFloat16, Float32
 from dataclasses import dataclass
 
-from megakernel.kernel_utils import (
+from transformer_megakernel.kernel_utils import (
     ld_acquire_u32, atomic_add_release, nanosleep,
     fence_proxy_async_shared_cta, fence_proxy_async_global, WarpgroupMeta, Phases, PipelineMeta
 )
@@ -170,8 +170,9 @@ class RMSNorm:
                     ready = cutlass.Int32(0)
                     while ready != pipeline.expected_cnt:
                         ready = ld_acquire_u32((mAtomics.iterator + pipeline.current_idx).toint())  # ty: ignore
-            warpgroup_sync()
             fence_proxy_async_global()
+            warpgroup_sync()
+            
 
         @cute.jit
         def load_regs(stage):
@@ -301,5 +302,6 @@ class RMSNorm:
             cute.arch.cp_async_bulk_wait_group(0)
             fence_proxy_async_global()
         cute.arch.mbarrier_arrive(output_bar_ot)
+        warpgroup_sync()
         signal_next_activation()
  

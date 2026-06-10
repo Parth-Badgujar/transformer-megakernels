@@ -12,8 +12,8 @@ import matplotlib.pyplot as plt
 import cutlass.cute as cute
 from cutlass.cute.runtime import from_dlpack
 from scheduler import get_attn_schedule
-from megakernel import LLMMegaKernel, LLMMegaKernelConfig
-from megakernel.model import MultiLayerTransformer, extract_weights
+from transformer_megakernel import LLMMegaKernel, LLMMegaKernelConfig
+from transformer_megakernel.model import MultiLayerTransformer, extract_weights
 
 torch.manual_seed(42)
 dtype  = torch.bfloat16

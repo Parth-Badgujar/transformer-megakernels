@@ -1,6 +1,5 @@
-from megakernel import megakernel
+from asyncio import subprocess
 import subprocess
-import time
 import modal
 import os
 
@@ -10,6 +9,7 @@ image = (
     modal.Image.from_registry("nvidia/cuda:13.2.1-devel-ubuntu24.04", add_python="3.12")
     .run_commands("apt update && apt install -y git")
     .uv_pip_install("torch", "nvidia-cutlass-dsl[cu13]")
+    .pip_install("uv")
     .workdir("/data")
 )
 
@@ -19,18 +19,24 @@ vol = modal.Volume.from_name("megakernel_volume", create_if_missing=True)
 def runner():
     import subprocess
     import os
-    subprocess.run(["pip3", "install", "-e", "."])
-    subprocess.run(["python3", "bench.py", "--n_iters", "1"])
+    if not os.path.exists(".venv"):
+        subprocess.run(["uv", "venv", "--python", "3.12"])
+    subprocess.run(["uv", "sync"])
+    subprocess.run(["uv", "run", "bench.py", "--n_iters", "100", "--num_rounds", "1000"])
     vol.commit()
+
+blacklist = ["__pycache__", "ptx", "cubin", "ncu-rep", "png", "npy", ".venv", ".git"]
 
 @app.local_entrypoint()
 def main():
     with vol.batch_upload(force = True) as batch:
         for file in os.listdir("."):
-            if "__pycache__" in file:
+            if any(item in file for item in blacklist):
                 continue
             if os.path.isdir(file):
+                print(f"Uploading Dir {file}")
                 batch.put_directory(file, file)
             else:
+                print(f"Uploading file {file}")
                 batch.put_file(file, file)
     runner.remote()

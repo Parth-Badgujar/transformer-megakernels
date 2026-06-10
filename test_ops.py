@@ -26,7 +26,7 @@ import torch.nn.functional as F
 import cutlass.cute as cute
 from cutlass.cute.runtime import from_dlpack
 
-from megakernel import LLMMegaKernel, LLMMegaKernelConfig
+from transformer_megakernel import LLMMegaKernel, LLMMegaKernelConfig
 from scheduler import OpScheduler          # <-- rename if your file is new_scheduler.py
 
 torch.manual_seed(1436)

@@ -85,19 +85,6 @@ def fence_proxy_async_shared_cta(*, loc=None, ip=None) -> None:
     )
 
 @dsl_user_op
-def fence_proxy_async(*, loc=None, ip=None) -> None:
-    llvm.inline_asm(
-        ir.Type.parse("!llvm.void"),
-        [],
-        "fence.proxy.async;",
-        "",
-        has_side_effects=True,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-    )
-
-
-@dsl_user_op
 def fence_proxy_async_global(*, loc=None, ip=None) -> None:
     llvm.inline_asm(
         ir.Type.parse("!llvm.void"),
