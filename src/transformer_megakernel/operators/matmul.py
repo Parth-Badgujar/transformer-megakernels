@@ -101,10 +101,6 @@ class Matmul:
                                                         self.config.stage_size * 2)
 
     @cute.jit
-    def _warpgroup_sync(self, *, group_id):
-        cute.arch.barrier(barrier_id=8 + group_id, number_of_threads=128)
-
-    @cute.jit
     def _wait_prev(self, *, expected_cnt, mAtomics, atomic_idx, warp_id, group_id):
         if warp_id == 0:
             with cute.arch.elect_one():
@@ -206,7 +202,6 @@ class Matmul:
         load_B = partial(self._load_B, tma_B=tma_B, tBgB=tBgB, tBsB=tBsB,
                          load_bar=load_bar, warp_id=warpgroup.warp_id)
         expect_tx = partial(self._expect_tx, load_bar=load_bar, warp_id=warpgroup.warp_id)
-        warpgroup_sync = partial(self._warpgroup_sync, group_id=warpgroup.group_id)
         wait_prev = partial(
             self._wait_prev,
             expected_cnt=pipeline.expected_cnt, mAtomics=mAtomics,
@@ -224,13 +219,9 @@ class Matmul:
         expect_tx(stage)
         load_B(stage, 0)
         wait_prev()
-        fence_proxy_async_global()
-        warpgroup_sync()
         load_A(stage, 0)
-        cute.arch.mbarrier_wait(compute_bar_me, phases.compute_phase)
-
         prefetch_stage = (stage + 1) % nS
-
+        cute.arch.mbarrier_wait(compute_bar_me, phases.compute_phase)
         # ---- mainloop: k_tiles-1 iterations, each prefetches the next tile ----
         for k_tile in cutlass.range(0, k_tiles - 1):
             expect_tx(prefetch_stage)
@@ -246,12 +237,11 @@ class Matmul:
             with cute.arch.elect_one():
                 stage_cell[0] = (stage + 1) % nS
                 phase_cell[0] = load_phase ^ (cutlass.Int32(1) << stage)
-        cute.arch.mbarrier_arrive(input_bar_ot)
 
         # ---- single trailing gemm ----
+        cute.arch.mbarrier_arrive(input_bar_ot)
         load_phase = wait_stage(stage, load_phase)
         gemm(stage)
-
         # ---- epilogue into the output section, after the output barrier ----
         cute.arch.mbarrier_wait(output_bar_me, phases.output_phase)
         self.epilogue(
@@ -274,7 +264,6 @@ class Matmul:
             cute.arch.cp_async_bulk_commit_group()
             cute.arch.cp_async_bulk_wait_group(0)
             fence_proxy_async_global()
-        warpgroup_sync()
         cute.arch.mbarrier_arrive(output_bar_ot)
         if warpgroup.group_tidx == 0:
             atomic_add_release((mAtomics.iterator + pipeline.next_idx).toint(), cutlass.Int32(1))  # ty: ignore

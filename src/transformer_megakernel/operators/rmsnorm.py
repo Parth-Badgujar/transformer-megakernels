@@ -170,8 +170,8 @@ class RMSNorm:
                     ready = cutlass.Int32(0)
                     while ready != pipeline.expected_cnt:
                         ready = ld_acquire_u32((mAtomics.iterator + pipeline.current_idx).toint())  # ty: ignore
-            fence_proxy_async_global()
             warpgroup_sync()
+            fence_proxy_async_global()
             
 
         @cute.jit
@@ -209,7 +209,7 @@ class RMSNorm:
         wv = rW.load().to(Float32)
 
         @cute.jit
-        def compute_and_store(stage, rX, is_last=False):
+        def compute_and_store(stage, rX):
             xv    = rX.load().to(Float32)
             xv_sq = xv * xv
             ssq_per_thr = xv_sq.reduce(cute.ReductionOp.ADD, init_val=Float32(0.0), reduction_profile=0)
@@ -222,7 +222,7 @@ class RMSNorm:
                 x = warpgroup.warp_id // wpr
                 y = warpgroup.warp_id %  wpr
                 scratch = cute.make_tensor(
-                    sO[None, None, stage].iterator,
+                    cute.recast(sO[None, None, stage].iterator, Float32),
                     cute.make_layout(shape=(num_sets, wpr)),
                 )
                 if warpgroup.lane_id == 0:
@@ -272,9 +272,9 @@ class RMSNorm:
             load_activations_async(stage, it + (nS - 1))
             wait_for_load_sync(prev_stage)
             rX = load_regs(prev_stage)
-            compute_and_store(prev_stage, rX)
             if it == 0:
                 cute.arch.mbarrier_wait(output_bar_me, phases.output_phase)
+            compute_and_store(prev_stage, rX)
             store_outputs_async(prev_stage, it)
             stage      = (stage + 1) % nS
             prev_stage = (prev_stage + 1) % nS
@@ -289,13 +289,15 @@ class RMSNorm:
             with cute.arch.elect_one():
                 load_stage[0] = (prev_stage + nS - 1) % nS
                 phase_cell[0] = load_phase ^ (cutlass.Int32(1) << prev_stage)
-        cute.arch.mbarrier_arrive(input_bar_ot)
  
-        # ---- epilogue: last chunk (already prefetched), single compute, is_last ----
+
+        cute.arch.mbarrier_arrive(input_bar_ot)
+
         wait_for_load_sync(prev_stage)
         rX = load_regs(prev_stage)
+        warpgroup_sync()
         cute.arch.mbarrier_arrive(compute_bar_ot)
-        compute_and_store(prev_stage, rX, is_last=True)
+        compute_and_store(prev_stage, rX)
         store_outputs_async(prev_stage, chunks - 1)
  
         if local_warp == 0:

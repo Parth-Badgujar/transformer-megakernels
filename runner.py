@@ -22,7 +22,7 @@ def runner():
     if not os.path.exists(".venv"):
         subprocess.run(["uv", "venv", "--python", "3.12"])
     subprocess.run(["uv", "sync"])
-    subprocess.run(["uv", "run", "bench.py", "--n_iters", "100", "--num_rounds", "1000"])
+    subprocess.run(["uv", "run", "bench.py", "--n_iters", "10000", "--num_rounds", "1000"])
     vol.commit()
 
 blacklist = ["__pycache__", "ptx", "cubin", "ncu-rep", "png", "npy", ".venv", ".git"]

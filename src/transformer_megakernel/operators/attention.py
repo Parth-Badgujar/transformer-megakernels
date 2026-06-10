@@ -59,6 +59,47 @@ class Attention:
     def __init__(self, config: AttentionConfig):
         self.config = config
 
+    @cute.jit
+    def get_qkvo_layout(self):
+        cfg = self.config
+        layout_atom  = cute.make_composed_layout(
+            cute.make_swizzle(cfg.swizzle_bits, 3, 3),
+            0,
+            cute.make_layout((8, cfg.smem_k_block), stride=(cfg.smem_k_block, 1)),
+        )
+        sKV_layout = cute.tile_to_shape(layout_atom, (cfg.bKV, cfg.head_dim), (0, 1))
+        sQ_layout  = cute.tile_to_shape(layout_atom, (cfg.bQ,  cfg.head_dim), (0, 1))
+        sO_layout  = cute.make_layout((cfg.bQ, cfg.head_dim), stride=(cfg.head_dim + cfg.output_pad, 1))
+        sO_tma_layout = cute.make_layout((cfg.bQ, cfg.head_dim + cfg.output_pad), stride=(cfg.head_dim + cfg.output_pad, 1))
+        return sKV_layout, sQ_layout, sO_layout, sO_tma_layout
+
+    @cute.jit
+    def get_tiled_mma(self):
+        cfg = self.config
+        tiled_mma_qk = cute.make_tiled_mma(
+            warp.MmaF16BF16Op(BFloat16, Float32, (16, 8, 16)),
+            (4, 1, 1), permutation_mnk=(cfg.bQ, cfg.bKV, cfg.head_dim),
+        )
+        tiled_mma_pv = cute.make_tiled_mma(
+            warp.MmaF16BF16Op(BFloat16, Float32, (16, 8, 16)),
+            (4, 1, 1), permutation_mnk=(cfg.bQ, cfg.head_dim, cfg.bKV),
+        )
+        return tiled_mma_qk, tiled_mma_pv
+
+    @cute.jit
+    def get_tiled_copy_cpasync(self):
+        atom_async = cpasync.CopyG2SOp(cache_mode=cute.nvgpu.LoadCacheMode.GLOBAL),
+        async_elems     = 128 // 16
+        cols_per_pass   = self.config.head_dim // async_elems
+        rows_per_pass   = 128 // cols_per_pass
+        tKV_layout      = cute.make_ordered_layout((rows_per_pass, cols_per_pass), order=(1, 0))
+        vKV_layout      = cute.make_layout((1, async_elems))
+        gmem_tiled_copy = cute.make_tiled_copy_tv(atom_async, tKV_layout, vKV_layout)
+        return gmem_tiled_copy
+
+
+        
+
     @staticmethod
     @cute.jit
     def _reshape_acc_to_mn(acc):
@@ -84,6 +125,11 @@ class Attention:
                     divided.stride[2][1]),
         )
         return cute.make_tensor(rP.iterator, mma_view)
+
+    # @cute.jit
+    # def load_k_gmem_to_smem(self, thr_cpy, gK, sK, kv_block_idx):
+
+
 
     @cute.jit
     def _warpgroup_sync(self, *, group_id):
@@ -133,8 +179,8 @@ class Attention:
             ready = cutlass.Int32(0)
             while ready != pipeline.expected_cnt:
                 ready = ld_acquire_u32((mAtomics.iterator + pipeline.current_idx).toint())  
-        fence_proxy_async_global()
         warpgroup_sync()
+        fence_proxy_async_global()
         
 
         smem_k_block = 64 if d % 64 == 0 else 32
@@ -152,6 +198,9 @@ class Attention:
 
         load_stage = storage.barriers.stage.get_tensor(cute.make_layout((1,)))
         c = load_stage[0]
+        warpgroup_sync()
+        if warpgroup.group_tidx == 0:
+            load_stage[0] = c ^ 1
         stages_ptr = storage.stages.data_ptr()
         
         sK = cute.make_tensor((stages_ptr + c * stage_skip).align(128), sKV_layout)
@@ -193,7 +242,10 @@ class Attention:
         smem_thr_V   = cute.make_tiled_copy_B(smem_atom_V,  tiled_mma_pv).get_slice(group_tid)
 
         gQ = cute.local_tile(mQ[b, h,    None, None], (bQ,  d), (qb,   0))
+        print("mK tensor:", mK)
+        print("mK tensor[b, h, None, None]:", mK[b, h, None, None])
         gK = cute.local_tile(mK[b, h_kv, None, None], (bKV, d), (None, 0))
+        print("gK tensor: ", gK)
         gV = cute.local_tile(mV[b, h_kv, None, None], (bKV, d), (None, 0))
 
         thr_mma_qk: cute.ThrMma = tiled_mma_qk.get_slice(group_tid)
@@ -202,7 +254,11 @@ class Attention:
         tQgQ = gmem_thr_copy.partition_S(gQ)
         tQsQ = gmem_thr_copy.partition_D(sQ)
         tKgK = gmem_thr_copy.partition_S(gK)
+        print("tKgK partition_S(gK)", tKgK)
+        print("tKgK[None, None, None, 0] :", tKgK[None, None, None, 0])
         tKsK = gmem_thr_copy.partition_D(sK)
+        print("sK: ", sK)
+        print("tKsK: ", tKsK)
         tVgV = gmem_thr_copy.partition_S(gV)
         tVsV = gmem_thr_copy.partition_D(sV)
 
@@ -247,7 +303,6 @@ class Attention:
         smem_store_bf = cute.make_copy_atom(cute.nvgpu.warp.StMatrix8x8x16bOp(num_matrices = 4), BFloat16)
 
         cute.arch.mbarrier_wait(self.compute_bar_me, phases.compute_phase)
-        fence_proxy_async_shared_cta()
         warpgroup_sync()
 
         for n in cutlass.range(num_kv_blocks):
@@ -255,7 +310,6 @@ class Attention:
             cute.arch.cp_async_commit_group()
             # ---- S = Q @ K^T ----
             cute.arch.cp_async_wait_group(1)
-            fence_proxy_async_shared_cta()
             warpgroup_sync()
             acc_S = cute.make_rmem_tensor(acc_shape_S, Float32)
             acc_S.fill(0.0)
@@ -264,11 +318,12 @@ class Attention:
             thread_K_S_cpy = smem_thr_K.retile(thread_K_S)
             cute.copy(smem_thr_K, shared_K_S, thread_K_S_cpy)
             cute.gemm(tiled_mma_qk, acc_S, thread_Q_S, thread_K_S, acc_S)
-            fence_proxy_async_shared_cta()
             warpgroup_sync()
             if n + cutlass.Int32(1) < cutlass.Int32(num_kv_blocks):
                 cute.copy(gmem_tiled_copy, tKgK[None, None, None, n + 1], tKsK)
                 cute.arch.cp_async_commit_group()
+            else:
+                cute.arch.mbarrier_arrive(self.input_bar_ot)
             # ---- online softmax ----
             acc_S_mn = Attention._reshape_acc_to_mn(acc_S)
             acc_O_mn = Attention._reshape_acc_to_mn(acc_O)
@@ -294,7 +349,6 @@ class Attention:
             thread_S_O = Attention._reshape_rP_to_mma_A(rP_bf)
             # ---- O += P @ V ----
             cute.arch.cp_async_wait_group(0)
-            fence_proxy_async_shared_cta()
             warpgroup_sync()
             sVt = cute.composition(sV, cute.make_layout((d, bKV), stride=(bKV, 1)))
             thread_V_O     = thr_mma_pv.make_fragment_B(thr_mma_pv.partition_B(sVt))
@@ -302,9 +356,10 @@ class Attention:
             thread_V_O_cpy = smem_thr_V.retile(thread_V_O)
             cute.copy(smem_thr_V, smem_V_O, thread_V_O_cpy)
             cute.gemm(tiled_mma_pv, acc_O, thread_S_O, thread_V_O, acc_O)
+            warpgroup_sync()
 
-        cute.arch.mbarrier_arrive(self.input_bar_ot)
         # ---- finalize softmax ----
+        cute.arch.mbarrier_arrive(self.compute_bar_ot)
         acc_O_mn = Attention._reshape_acc_to_mn(acc_O)
         for r in cutlass.range_constexpr(num_rows_per_thr):  
             row_sum[r] = cute.arch.warp_reduction_sum(row_sum[r], threads_in_group=4)
@@ -314,7 +369,6 @@ class Attention:
         # ---- write O into the output section, AFTER the output barrier ----
         rO_bf = cute.make_fragment_like(acc_O, BFloat16)
         cute.arch.mbarrier_wait(self.output_bar_me, phases.output_phase)
-        cute.arch.mbarrier_arrive(self.compute_bar_ot)
         rO_bf.store(acc_O.load().to(BFloat16))
         smem_thr_Ow = cute.make_tiled_copy_C(smem_store_bf, tiled_mma_pv).get_slice(group_tid)
         smem_O_acc  = smem_thr_Ow.partition_D(sO)
