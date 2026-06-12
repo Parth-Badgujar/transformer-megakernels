@@ -5,7 +5,10 @@ build/
 dist/
 wheels/
 *.egg-info
-
+*.aux
+*.log
+*.pdf
+*.tex
 # Virtual environments
 .venv
 *.pt
