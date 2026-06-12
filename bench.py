@@ -53,13 +53,13 @@ num_stages    = 2          # V2 is two-stage
 is_causal     = False
 num_layers    = 4
 ff_dim        = 512
-warps_per_row = 1          # V2: replaces bR; num_sets = 4 // warps_per_row
+warps_per_row = 1  # V2: replaces bR; num_sets = 4 // warps_per_row
 
 embed_dim  = num_q_heads * head_dim
 qkv_dim    = (num_q_heads + 2 * num_kv_heads) * head_dim
 num_tokens = batch_size * seq_len
 
-bM = 64
+bM = 128
 num_sets = 4 // warps_per_row
 rows_per_rms_block = get_rms_block(num_tokens, num_sms, bM=bM)
 # RMS tile must be a multiple of num_sets and divide bM
@@ -243,7 +243,7 @@ if num_rounds > 1:
 # -----------------------------------------------------------------------------
 warmup = 5
 
-model_compile = torch.compile(model)
+model_compile = torch.compile(model, mode = "max-autotune")
 for _ in range(warmup):
     model_compile(sample_input)
 torch.cuda.synchronize()

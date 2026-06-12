@@ -67,8 +67,8 @@ class Matmul:
     def _get_tiled_mma(self) -> cute.TiledMma:
         return cute.make_tiled_mma(
             warp.MmaF16BF16Op(cutlass.BFloat16, cutlass.Float32, (16, 8, 16)),
-            (2, 2, 1),
-            permutation_mnk=(self.config.bM, self.config.bN, 64),
+            (4, 1, 1),
+            permutation_mnk=(self.config.bM, self.config.bN, self.config.bK),
         )
 
     @cute.jit
