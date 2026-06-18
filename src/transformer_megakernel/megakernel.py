@@ -1,3 +1,4 @@
+import math
 import os
 os.environ["CUTE_DSL_LINEINFO"] = "1"
 
@@ -111,10 +112,11 @@ class LLMMegaKernel:
 
         self.rms_config = RMSNormConfig(
             embed_dim          = self.embed_dim,
-            num_stages         = self.num_stages,
-            rows_per_rms_block = self.rows_per_rms_block,
-            bM                 = self.bM,
-            stage_elems        = self.stage_elements,
+            bRMS = self.rows_per_rms_block,
+            # num_stages         = self.num_stages,
+            # rows_per_rms_block = self.rows_per_rms_block,
+            # bM                 = self.bM,
+            stage_elements     = self.stage_elements,
             warps_per_row      = self.warps_per_row,
         )
 
@@ -123,8 +125,7 @@ class LLMMegaKernel:
             bN = self.bN,
             bK = self.bK,
             num_stages = self.num_stages,
-            stage_skip = self.stage_elements,
-            use_tma_store = True,
+            stage_elements = self.stage_elements,
             use_tma_reduce = self.use_tma_reduce,
             output_pad = self.output_pad,
         )
@@ -138,8 +139,9 @@ class LLMMegaKernel:
             num_q_heads = self.num_q_heads,
             num_kv_heads = self.num_kv_heads,
             num_stages = self.num_stages,
-            stage_skip = self.stage_elements,
+            stage_elements = self.stage_elements,
             output_pad = self.output_pad,
+            is_causal = self.config.is_causal
         )
 
     @cute.jit
@@ -161,7 +163,7 @@ class LLMMegaKernel:
 
         @cute.struct
         class SharedStorage:
-            barriers: BarrierStorage 
+            barriers: BarrierStorage
             stages: cute.struct.Align[cute.struct.MemRange[BFloat16, self.num_stages * self.stage_elements], 128]
             out:    cute.struct.Align[cute.struct.MemRange[BFloat16, num_out_elements], 128]
 
@@ -198,8 +200,8 @@ class LLMMegaKernel:
 
         # QKV Split Layout
         mQ = cute.make_tensor(mWorkspace2.iterator,         q_layout)
-        mK = cute.make_tensor(mWorkspace2.iterator + k_off, kv_layout) 
-        mV = cute.make_tensor(mWorkspace2.iterator + v_off, kv_layout) 
+        mK = cute.make_tensor(mWorkspace2.iterator + k_off, kv_layout)
+        mV = cute.make_tensor(mWorkspace2.iterator + v_off, kv_layout)
 
         mAttn_out = cute.make_tensor(
             mWorkspace1.iterator, cute.make_ordered_layout(
@@ -236,11 +238,11 @@ class LLMMegaKernel:
         )
 
         matmul_A_sw = cute.make_composed_layout(
-            cute.make_swizzle(3, 4, 3), 0,
+            cute.make_swizzle(int(math.log2(self.bK)) - 3, 4, 3), 0,
             cute.make_ordered_layout(shape=(self.bM, self.bK), order=(1, 0)),
         )
         matmul_B_sw = cute.make_composed_layout(
-            cute.make_swizzle(3, 4, 3), 0,
+            cute.make_swizzle(int(math.log2(self.bK)) - 3, 4, 3), 0,
             cute.make_ordered_layout(shape=(1, self.bN, self.bK), order=(2, 1, 0)),
         )
         matmul_C_pad = cute.make_ordered_layout(
@@ -395,9 +397,9 @@ class LLMMegaKernel:
             with cute.arch.elect_one():
                 load_stage[0]      = 0
                 load_phase_cell[0] = 0
-                for i in cutlass.range_constexpr(self.num_stages): 
+                for i in cutlass.range_constexpr(self.num_stages):
                     cute.arch.mbarrier_init(load_barriers + i, 1)
-                for i in cutlass.range_constexpr(2): 
+                for i in cutlass.range_constexpr(2):
                     cute.arch.mbarrier_init(input_barriers + i,   128)
                     cute.arch.mbarrier_init(output_barriers + i,  128)
                     cute.arch.mbarrier_init(compute_barriers + i, 128)
@@ -424,13 +426,13 @@ class LLMMegaKernel:
             current_idx  = mSchedule[block_id, work_idx, 5]
             next_idx     = mSchedule[block_id, work_idx, 6]
 
-            op_kind   = op & 0x7 
-            layer_idx = op >> 3  
+            op_kind   = op & 0x7
+            layer_idx = op >> 3
 
             pipeline = PipelineMeta(
-                current_idx  = current_idx,  
-                expected_cnt = expected_cnt, 
-                next_idx     = next_idx,     
+                current_idx  = current_idx,
+                expected_cnt = expected_cnt,
+                next_idx     = next_idx,
             )
 
             if op_kind == int(Op.RMS):
@@ -438,7 +440,7 @@ class LLMMegaKernel:
                 self.rmsnorm.run(
                     g_RMS_inp, g_RMS_out, mRMS_weights,
                     tma_RMS_inp, tma_RMS_out,
-                    rms_w_idx, pid_m, pid_n,           # pid_n occupies weight_reuse slot (ignored in V2)
+                    rms_w_idx, pid_m,           # pid_n occupies weight_reuse slot (ignored in V2)
                     mAtomics, pipeline, phases,
                     warpgroup, storage,
                 )

@@ -4,6 +4,7 @@ from functools import partial
 from typing import Callable
 
 import cutlass
+from cutlass import BFloat16, Float32, Int32
 import cutlass.cute as cute
 from cutlass.cute.nvgpu import cpasync, warp
 
@@ -11,29 +12,8 @@ from transformer_megakernel.kernel_utils import (
     ld_acquire_u32,
     atomic_add_release,
     fence_proxy_async_global,
-    fence_proxy_async_shared_cta,
     WarpgroupMeta, PipelineMeta, Phases
 )
-
-
-# =============================================================================
-# V2 NOTES
-# -----------------------------------------------------------------------------
-# Two-stage pipeline (nS = 2).  Differences from V1:
-#   * prologue prefetches ONE stage (not two) into the shared `stage` slot,
-#   * the mainloop runs k_tiles-1 iterations, each prefetching the next tile,
-#   * exactly ONE trailing gemm sits outside the loop (no second trailing gemm),
-#   * the output tile lives in the dedicated output section and is filled by the
-#     epilogue AFTER the compute barrier, then TMA-stored.
-# Stage handoff bookkeeping is kept identical in spirit to V1: we publish the
-# next start stage = (last_gemm_stage + 1) % nS and pre-toggle the load phase for
-# the last gemm's stage before issuing its wait.
-#
-# bM/bN are config-driven.  bM=128,bN=128 => 128 fp32 accumulator regs/thread
-# (one warpgroup) which is near the ceiling; if ptxas reports spills, drop bN to
-# 64 (=> 64 regs/thread) and split the N dimension at the scheduler level.
-# =============================================================================
-
 
 @dataclass
 class MatmulConfig:
@@ -41,21 +21,18 @@ class MatmulConfig:
     bN: int
     bK: int
     num_stages: int
-    stage_skip: int
+    stage_elements: int
     output_pad: int
-    use_tma_store: bool
     use_tma_reduce: bool
 
     def __post_init__(self):
         self.stage_size  = (self.bM + self.bN) * self.bK
-        self.swizzle_bits = int(math.log2(self.bK)) - 3
         assert self.bM in (32, 64, 128)
         assert self.bN in (32, 64, 128)
         assert self.bK in (32, 64)
         assert self.num_stages == 2, "V2 matmul is two-stage"
-        assert self.stage_skip >= self.stage_size
+        assert self.stage_elements >= self.stage_size
         assert self.output_pad in (0, 8, 16)
-        assert self.swizzle_bits in (2, 3)
 
 
 class Matmul:
@@ -65,9 +42,12 @@ class Matmul:
 
     @cute.jit
     def _get_tiled_mma(self) -> cute.TiledMma:
+        cfg = self.config
+        warpM = min(4, cfg.bM // 16)
+        warpN = 4 // warpM
         return cute.make_tiled_mma(
-            warp.MmaF16BF16Op(cutlass.BFloat16, cutlass.Float32, (16, 8, 16)),
-            (4, 1, 1),
+            warp.MmaF16BF16Op(BFloat16, Float32, (16, 8, 16)),
+            (warpM, warpN, 1),
             permutation_mnk=(self.config.bM, self.config.bN, self.config.bK),
         )
 
@@ -101,17 +81,9 @@ class Matmul:
                                                         self.config.stage_size * 2)
 
     @cute.jit
-    def _wait_prev(self, *, expected_cnt, mAtomics, atomic_idx, warp_id, group_id):
-        if warp_id == 0:
-            with cute.arch.elect_one():
-                ready = cutlass.Int32(0)
-                while ready != expected_cnt:
-                    ready = ld_acquire_u32((mAtomics.iterator + atomic_idx).toint())
-
-    @cute.jit
     def _wait_stage(self, stage_idx, load_phase, *, load_bar):
         cute.arch.mbarrier_wait(load_bar + stage_idx, (load_phase >> stage_idx) & 1)
-        return load_phase ^ (cutlass.Int32(1) << stage_idx)
+        return load_phase ^ (1 << stage_idx)
 
     @cute.jit
     def run(
@@ -123,9 +95,9 @@ class Matmul:
         tma_A: cute.CopyAtom,
         tma_B: cute.CopyAtom,
         tma_C: cute.CopyAtom,
-        layer_idx: cutlass.Int32,
-        pid_m: cutlass.Int32,
-        pid_n: cutlass.Int32,
+        layer_idx: Int32,
+        pid_m: Int32,
+        pid_n: Int32,
         mAtomics: cute.Tensor,
         pipeline: PipelineMeta,
         phases: Phases,
@@ -133,28 +105,37 @@ class Matmul:
         storage,
     ):
         cfg = self.config
-        bM, bN, bK, nS = cfg.bM, cfg.bN, cfg.bK, cfg.num_stages
-        k_tiles = gA.shape[1] // bK  # ty: ignore
+        k_tiles = gA.shape[1] // cfg.bK
         tiled_mma = self._get_tiled_mma()
-        sw = cute.make_swizzle(3, 4, 3)
-        STAGE_ELEMS = cfg.stage_skip
+        swizzle = cute.make_swizzle(3, 4, 3)
 
-        sA_layout = cute.make_layout(shape=(bM, bK, nS), stride=(bK, 1, STAGE_ELEMS))
-        sB_layout = cute.make_layout(shape=(bN, bK, nS), stride=(bK, 1, STAGE_ELEMS))
-
-        PAD = cfg.output_pad
-        sC_layout     = cute.make_layout(shape=(bM, bN),       stride=(bN + PAD, 1))
-        sC_tma_layout = cute.make_layout(shape=(bM, bN + PAD), stride=(bN + PAD, 1))
+        sA_layout = cute.make_layout(
+            shape = (cfg.bM, cfg.bK, cfg.num_stages),
+            stride = (cfg.bK, 1, cfg.stage_elements)
+        )
+        sB_layout = cute.make_layout(
+            shape = (cfg.bN, cfg.bK, cfg.num_stages),
+            stride = (cfg.bK, 1, cfg.stage_elements)
+        )
+        sC_layout = cute.make_layout(
+            shape = (cfg.bM, cfg.bN),
+            stride = (cfg.bN + cfg.output_pad, 1)
+        )
+        sC_tma_layout = cute.make_layout(
+            shape = (cfg.bM, cfg.bN + cfg.output_pad),
+            stride = (cfg.bN + cfg.output_pad, 1)
+        )
 
         stages_ptr = storage.stages.data_ptr()
-        sA = cute.make_tensor(cute.recast_ptr(stages_ptr,           sw, dtype=cutlass.BFloat16), sA_layout)
-        sB = cute.make_tensor(cute.recast_ptr(stages_ptr + bM * bK, sw, dtype=cutlass.BFloat16), sB_layout)
 
-        sC     = storage.out.get_tensor(sC_layout)
+        sA = cute.make_tensor(cute.recast_ptr(stages_ptr, swizzle), sA_layout)
+        sB = cute.make_tensor(cute.recast_ptr(stages_ptr + cfg.bM * cfg.bK, swizzle), sB_layout)
+
+        sC = storage.out.get_tensor(sC_layout)
         sC_tma = storage.out.get_tensor(sC_tma_layout)
 
-        gA_tile = cute.local_tile(gA, (bM, bK),    (pid_m, None))
-        gB_tile = cute.local_tile(gB, (1, bN, bK), (layer_idx, pid_n, None))
+        gA_tile = cute.local_tile(gA, (cfg.bM, cfg.bK),    (pid_m, None))
+        gB_tile = cute.local_tile(gB, (1, cfg.bN, cfg.bK), (layer_idx, pid_n, None))
 
         sA_g = cute.group_modes(sA, 0, 2)
         sB_g = cute.group_modes(sB, 0, 2)
@@ -168,13 +149,13 @@ class Matmul:
         tCrA = thr_mma.make_fragment_A(thr_mma.partition_A(sA[None, None, 0]))
         tCrB = thr_mma.make_fragment_B(thr_mma.partition_B(sB[None, None, 0]))
 
-        acc_shape = thr_mma.partition_shape_C((bM, bN))
-        tCrC = cute.make_rmem_tensor(acc_shape, cutlass.Float32)
+        acc_shape = thr_mma.partition_shape_C((cfg.bM, cfg.bN))
+        tCrC = cute.make_rmem_tensor(acc_shape, Float32)
         tCrC.fill(0.0)
 
-        ld_op = warp.LdMatrix8x8x16bOp(transpose=False, num_matrices=4)
-        ca = cute.make_copy_atom(ld_op, cutlass.BFloat16)
-        cb = cute.make_copy_atom(ld_op, cutlass.BFloat16)
+        ldmatrix = warp.LdMatrix8x8x16bOp(transpose=False, num_matrices=4)
+        ca = cute.make_copy_atom(ldmatrix, BFloat16)
+        cb = cute.make_copy_atom(ldmatrix, BFloat16)
         thr_copy_A = cute.make_tiled_copy_A(ca, tiled_mma).get_slice(warpgroup.group_tidx)
         thr_copy_B = cute.make_tiled_copy_B(cb, tiled_mma).get_slice(warpgroup.group_tidx)
 
@@ -193,34 +174,49 @@ class Matmul:
 
         gemm = partial(
             self._gemm,
-            thr_copy_A=thr_copy_A, thr_copy_B=thr_copy_B,
-            sA=sA, sB=sB, tiled_mma=tiled_mma,
-            tCrA=tCrA, tCrB=tCrB, tCrC=tCrC,
+            thr_copy_A = thr_copy_A, thr_copy_B = thr_copy_B,
+            sA = sA, sB = sB, tiled_mma = tiled_mma,
+            tCrA = tCrA, tCrB = tCrB, tCrC = tCrC,
         )
-        load_A = partial(self._load_A, tma_A=tma_A, tAgA=tAgA, tAsA=tAsA,
-                         load_bar=load_bar, warp_id=warpgroup.warp_id)
-        load_B = partial(self._load_B, tma_B=tma_B, tBgB=tBgB, tBsB=tBsB,
-                         load_bar=load_bar, warp_id=warpgroup.warp_id)
-        expect_tx = partial(self._expect_tx, load_bar=load_bar, warp_id=warpgroup.warp_id)
-        wait_prev = partial(
-            self._wait_prev,
-            expected_cnt=pipeline.expected_cnt, mAtomics=mAtomics,
-            atomic_idx=pipeline.current_idx, warp_id=warpgroup.warp_id,
-            group_id=warpgroup.group_id,
+        load_A = partial(
+            self._load_A,
+            tma_A = tma_A,
+            tAgA = tAgA, tAsA = tAsA,
+            load_bar = load_bar,
+            warp_id = warpgroup.warp_id
         )
-        wait_stage = partial(self._wait_stage, load_bar=load_bar)
+        load_B = partial(
+            self._load_B,
+            tma_B = tma_B,
+            tBgB = tBgB, tBsB = tBsB,
+            load_bar = load_bar,
+            warp_id = warpgroup.warp_id
+        )
+        expect_tx = partial(
+            self._expect_tx,
+            load_bar = load_bar,
+            warp_id = warpgroup.warp_id
+        )
+        wait_stage = partial(
+            self._wait_stage,
+            load_bar = load_bar
+        )
 
         cute.arch.mbarrier_wait(input_bar_me, phases.input_phase)
-        fence_proxy_async_shared_cta()
         stage      = stage_cell[0]
         load_phase = phase_cell[0]
 
         # ---- prologue: prefetch a SINGLE stage ----
         expect_tx(stage)
         load_B(stage, 0)
-        wait_prev()
+        if warpgroup.warp_id == 0:
+            with cute.arch.elect_one():
+                ready = 0
+                while ready != pipeline.expected_cnt:
+                    ready = ld_acquire_u32((mAtomics.iterator + pipeline.current_idx).toint())
+            cute.arch.sync_warp()
         load_A(stage, 0)
-        prefetch_stage = (stage + 1) % nS
+        prefetch_stage = (stage + 1) % cfg.num_stages
         cute.arch.mbarrier_wait(compute_bar_me, phases.compute_phase)
         # ---- mainloop: k_tiles-1 iterations, each prefetches the next tile ----
         for k_tile in cutlass.range(0, k_tiles - 1):
@@ -229,14 +225,14 @@ class Matmul:
             load_B(prefetch_stage, k_tile + 1)
             load_phase = wait_stage(stage, load_phase)
             gemm(stage)
-            stage          = (stage + 1) % nS
-            prefetch_stage = (prefetch_stage + 1) % nS
+            stage          = (stage + 1) % cfg.num_stages
+            prefetch_stage = (prefetch_stage + 1) % cfg.num_stages
 
         # ---- stage handoff (pre-toggle phase for the final gemm's stage) ----
         if warpgroup.warp_id == 1:
             with cute.arch.elect_one():
-                stage_cell[0] = (stage + 1) % nS
-                phase_cell[0] = load_phase ^ (cutlass.Int32(1) << stage)
+                stage_cell[0] = (stage + 1) % cfg.num_stages
+                phase_cell[0] = load_phase ^ (1 << stage)
 
         # ---- single trailing gemm ----
         cute.arch.mbarrier_arrive(input_bar_ot)
@@ -244,17 +240,22 @@ class Matmul:
         gemm(stage)
         # ---- epilogue into the output section, after the output barrier ----
         cute.arch.mbarrier_wait(output_bar_me, phases.output_phase)
+        cute.arch.mbarrier_arrive(compute_bar_ot)
+
         self.epilogue(
-            tiled_mma=tiled_mma,
-            tCrC=tCrC, sC=sC,
-            warpgroup=warpgroup,
-            gC=gC, gC_tma=gC_tma,
-            pid_m=pid_m, pid_n=pid_n,
-            bM=bM, bN=bN,
+            tiled_mma = tiled_mma,
+            tCrC = tCrC,
+            sC = sC,
+            warpgroup = warpgroup,
+            gC = gC,
+            gC_tma = gC_tma,
+            pid_m = pid_m,
+            pid_n = pid_n,
+            bM = cfg.bM,
+            bN = cfg.bN,
             use_tma_reduce=cfg.use_tma_reduce,
         )
 
-        cute.arch.mbarrier_arrive(compute_bar_ot)
         if warpgroup.warp_id == 0:
             gC_tma_tile = cute.local_tile(gC_tma, (cfg.bM, 1, cfg.bN + cfg.output_pad), (pid_m, pid_n, 0))
             sC_g     = cute.group_modes(sC_tma,      0, cute.rank(sC_tma.layout))
@@ -266,4 +267,4 @@ class Matmul:
             fence_proxy_async_global()
         cute.arch.mbarrier_arrive(output_bar_ot)
         if warpgroup.group_tidx == 0:
-            atomic_add_release((mAtomics.iterator + pipeline.next_idx).toint(), cutlass.Int32(1))  # ty: ignore
+            atomic_add_release((mAtomics.iterator + pipeline.next_idx).toint(), 1)

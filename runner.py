@@ -8,7 +8,7 @@ app = modal.App(name="megakernels")
 image = (
     modal.Image.from_registry("nvidia/cuda:13.2.1-devel-ubuntu24.04", add_python="3.12")
     .run_commands("apt update && apt install -y git")
-    .uv_pip_install("torch", "nvidia-cutlass-dsl[cu13]")
+    .uv_pip_install("torch", "nvidia-cutlass-dsl[cu13]", "nvitop")
     .pip_install("uv")
     .workdir("/data")
 )
@@ -22,7 +22,7 @@ def runner():
     if not os.path.exists(".venv"):
         subprocess.run(["uv", "venv", "--python", "3.12"])
     subprocess.run(["uv", "sync"])
-    subprocess.run(["uv", "run", "bench.py", "--n_iters", "1000", "--num_rounds", "1000"])
+    subprocess.run(["uv", "run", "python3", "-u", "bench.py", "--n_iters", "1000", "--num_rounds", "1000"])
     vol.commit()
 
 blacklist = ["__pycache__", "ptx", "cubin", "ncu-rep", "png", "npy", ".venv", ".git"]

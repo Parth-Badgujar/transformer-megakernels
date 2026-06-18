@@ -9,6 +9,7 @@ dependencies = [
     "modal>=1.4.3",
     "nvidia-cutlass-dsl[cu13]>=4.5.2",
     "torch>=2.11.0",
+    "tqdm"
 ]
 
 [build-system]

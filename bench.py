@@ -45,14 +45,14 @@ def get_rms_block(seq, num_sms, bM):
 # Problem / config  (V2: two-stage, bM=64 for now)
 # -----------------------------------------------------------------------------
 head_dim      = 128
-batch_size    = 16
-seq_len       = 256
-num_q_heads   = 4
-num_kv_heads  = 4
+batch_size    = 8
+seq_len       = 512
+num_q_heads   = 16
+num_kv_heads  = 2
 num_stages    = 2          # V2 is two-stage
-is_causal     = False
-num_layers    = 4
-ff_dim        = 512
+is_causal     = True
+num_layers    = 9
+ff_dim        = 11008
 warps_per_row = 1  # V2: replaces bR; num_sets = 4 // warps_per_row
 
 embed_dim  = num_q_heads * head_dim
@@ -186,7 +186,8 @@ else:
 # Correctness
 # -----------------------------------------------------------------------------
 max_errs, mean_errs, rel_errs = [], [], []
-for i in range(num_rounds):
+from tqdm.auto import tqdm
+for i in tqdm(range(num_rounds)):
     mAtomics.zero_()
     compiled(cSchedule, cAtomics, cRms_w, cQkv_w, cWs1, cWs2,
              cGate_w, cUp_w, cDown_w, cOut_w, c_embedding_arr[i])
@@ -241,29 +242,40 @@ if num_rounds > 1:
 # -----------------------------------------------------------------------------
 # Benchmark: torch.compile vs megakernel vs eager
 # -----------------------------------------------------------------------------
-warmup = 5
+warmup = 10
+start = torch.cuda.Event(enable_timing=True)
+stop = torch.cuda.Event(enable_timing=True)
 
-model_compile = torch.compile(model, mode = "max-autotune")
+model_compile = torch.compile(model)
 for _ in range(warmup):
     model_compile(sample_input)
-torch.cuda.synchronize()
 
-t0 = time.perf_counter_ns()
+start.record()
 for _ in range(n_iters):
     model_compile(sample_input)
+stop.record()
 torch.cuda.synchronize()
-print(f"[compile] {((time.perf_counter_ns() - t0) / 1e6) / n_iters:.3f}ms", flush=True)
+print(f"[compile] {start.elapsed_time(stop) / n_iters:.3f}ms", flush=True)
 
-t0 = time.perf_counter_ns()
+start = torch.cuda.Event(enable_timing=True)
+stop = torch.cuda.Event(enable_timing=True)
+
+for i in range(warmup):
+    mAtomics.zero_()
+    compiled(cSchedule, cAtomics, cRms_w, cQkv_w, cWs1, cWs2,
+             cGate_w, cUp_w, cDown_w, cOut_w, cEmbedding)
+
+start.record()
 for _ in range(n_iters):
     mAtomics.zero_()
     compiled(cSchedule, cAtomics, cRms_w, cQkv_w, cWs1, cWs2,
              cGate_w, cUp_w, cDown_w, cOut_w, cEmbedding)
+stop.record()
 torch.cuda.synchronize()
-print(f"[mega]    {((time.perf_counter_ns() - t0) / 1e6) / n_iters:.3f}ms", flush=True)
+print(f"[mega]    {start.elapsed_time(stop) / n_iters:.3f}ms", flush=True)
 
-t0 = time.perf_counter_ns()
-for _ in range(n_iters):
-    model(sample_input)
-torch.cuda.synchronize()
-print(f"[eager]   {((time.perf_counter_ns() - t0) / 1e6) / n_iters:.3f}ms", flush=True)
+# t0 = time.perf_counter_ns()
+# for _ in range(n_iters):
+#     model(sample_input)
+# torch.cuda.synchronize()
+# print(f"[eager]   {((time.perf_counter_ns() - t0) / 1e6) / n_iters:.3f}ms", flush=True)

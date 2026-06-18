@@ -134,7 +134,6 @@ class Attention:
             while ready != pipeline.expected_cnt:
                 ready = ld_acquire_u32((mAtomics.iterator + pipeline.current_idx).toint())  
         warpgroup_sync()
-        fence_proxy_async_global()
 
         smem_k_block = 64 if d % 64 == 0 else 32
         swizzle_bits = 3 if smem_k_block == 64 else 2
@@ -246,7 +245,6 @@ class Attention:
         )
 
         cute.arch.mbarrier_wait(self.compute_bar_me, phases.compute_phase)
-        fence_proxy_async_shared_cta()
         warpgroup_sync()
 
         for n in cutlass.range(num_kv_blocks):

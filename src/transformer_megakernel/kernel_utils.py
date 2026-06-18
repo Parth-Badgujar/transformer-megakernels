@@ -6,9 +6,6 @@ from cutlass._mlir import ir
 from cutlass._mlir.dialects import llvm
 from cutlass.cute.arch import dsl_user_op
 
-
-LOG2_E = math.log2(math.e)
-
 @dataclass
 class WarpgroupMeta:
     tidx: int
