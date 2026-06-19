@@ -96,7 +96,7 @@ class TransformerLayer(nn.Module):
         return residual + x
 
 
-class MultiLayerTransformer(nn.Module):
+class Transformer(nn.Module):
     def __init__(
         self,
         embed_dim: int,
@@ -122,7 +122,7 @@ class MultiLayerTransformer(nn.Module):
         return x
 
 
-def extract_weights(model: MultiLayerTransformer):
+def extract_weights(model: Transformer):
     rms_w = []
     qkv_w = []
     out_w = []

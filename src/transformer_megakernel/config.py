@@ -2,7 +2,7 @@ from enum import IntEnum
 from dataclasses import dataclass
 
 @dataclass
-class MegaKernelConfig:
+class MegakernelConfig:
     embed_dim:          int
     kv_len:             int
     q_len:              int

@@ -13,8 +13,8 @@ import cutlass.cute as cute
 from cutlass.cute.runtime import from_dlpack
 
 from transformer_megakernel.scheduler import get_attn_schedule
-from transformer_megakernel import LLMMegaKernel, LLMMegaKernelConfig
-from transformer_megakernel.model import MultiLayerTransformer, extract_weights
+from transformer_megakernel import Megakernel, MegakernelConfig, TransformerMegakernel
+from transformer_megakernel.model import Transformer, extract_weights
 
 
 # -----------------------------------------------------------------------------
@@ -44,22 +44,34 @@ def get_rms_block(seq, num_sms, bM):
 # -----------------------------------------------------------------------------
 # Problem / config  (V2: two-stage, bM=64 for now)
 # -----------------------------------------------------------------------------
+# head_dim      = 128
+# batch_size    = 8
+# seq_len       = 512
+# num_q_heads   = 16
+# num_kv_heads  = 2
+# num_stages    = 2          # V2 is two-stage
+# is_causal     = True
+# num_layers    = 9
+# ff_dim        = 4096
+# warps_per_row = 1  # V2: replaces bR; num_sets = 4 // warps_per_row
+
 head_dim      = 128
-batch_size    = 8
-seq_len       = 512
-num_q_heads   = 16
-num_kv_heads  = 2
+batch_size    = 16
+seq_len       = 256
+num_q_heads   = 4
+num_kv_heads  = 4
 num_stages    = 2          # V2 is two-stage
 is_causal     = True
-num_layers    = 9
-ff_dim        = 11008
-warps_per_row = 1  # V2: replaces bR; num_sets = 4 // warps_per_row
+num_layers    = 4
+ff_dim        = 512
+warps_per_row = 1 
+
 
 embed_dim  = num_q_heads * head_dim
 qkv_dim    = (num_q_heads + 2 * num_kv_heads) * head_dim
 num_tokens = batch_size * seq_len
 
-bM = 128
+bM = 64
 num_sets = 4 // warps_per_row
 rows_per_rms_block = get_rms_block(num_tokens, num_sms, bM=bM)
 # RMS tile must be a multiple of num_sets and divide bM
@@ -68,7 +80,7 @@ rows_per_rms_block = max(rows_per_rms_block, num_sets)
 print("SM Count =", num_sms)
 print("Using BLOCK RMS =", rows_per_rms_block)
 
-cfg = LLMMegaKernelConfig(
+cfg = MegakernelConfig(
     embed_dim          = embed_dim,
     kv_len             = seq_len,
     q_len              = seq_len,
@@ -100,12 +112,12 @@ print(f"Max works per SM: {max_works}")
 # -----------------------------------------------------------------------------
 # Reference models (bf16 + fp32) and weights
 # -----------------------------------------------------------------------------
-model = MultiLayerTransformer(
+model = Transformer(
     embed_dim, num_q_heads, num_kv_heads, ff_dim, num_layers, is_causal=is_causal
 ).cuda()
 model.eval()
 
-model_f32 = MultiLayerTransformer(
+model_f32 = Transformer(
     embed_dim, num_q_heads, num_kv_heads, ff_dim, num_layers,
     is_causal=is_causal, dtype=torch.float32,
 ).cuda()
@@ -151,7 +163,7 @@ cEmbedding       = from_dlpack(embedding, assumed_align=16)
 # -----------------------------------------------------------------------------
 # Compile
 # -----------------------------------------------------------------------------
-kernel = LLMMegaKernel(cfg)
+kernel = Megakernel(cfg)
 
 # clear stale artifacts (shell glob needs shell=True)
 subprocess.run("rm -f *.ptx *.cubin", shell=True)
@@ -161,11 +173,12 @@ ref_f32 = model_f32(sample_input_f32)
 
 print("[compile] starting", flush=True)
 t0 = time.time()
-compiled = cute.compile(
-    kernel,
-    cSchedule, cAtomics, cRms_w, cQkv_w, cWs1, cWs2,
-    cGate_w, cUp_w, cDown_w, cOut_w, cEmbedding,
-)
+# compiled = cute.compile(
+#     kernel,
+#     cSchedule, cAtomics, cRms_w, cQkv_w, cWs1, cWs2,
+#     cGate_w, cUp_w, cDown_w, cOut_w, cEmbedding,
+# )
+kernel = TransformerMegakernel(model = model, config = cfg)
 print(f"[compile] done in {time.time() - t0:.2f}s", flush=True)
 
 # ptxas pass (glob in python so we don't depend on a shell)
@@ -188,12 +201,13 @@ else:
 max_errs, mean_errs, rel_errs = [], [], []
 from tqdm.auto import tqdm
 for i in tqdm(range(num_rounds)):
-    mAtomics.zero_()
-    compiled(cSchedule, cAtomics, cRms_w, cQkv_w, cWs1, cWs2,
-             cGate_w, cUp_w, cDown_w, cOut_w, c_embedding_arr[i])
+    # mAtomics.zero_()
+    output = kernel(embedding.view(batch_size * seq_len, embed_dim))
+    # compiled(cSchedule, cAtomics, cRms_w, cQkv_w, cWs1, cWs2,
+    #          cGate_w, cUp_w, cDown_w, cOut_w, c_embedding_arr[i])
     torch.cuda.synchronize()
 
-    out = embeddings_arr[i].view(batch_size, seq_len, -1).float()
+    out = output.view(batch_size, seq_len, -1).float()
     diff = (out - ref.float()).abs()
 
     max_errs.append(diff.max().item())
@@ -243,37 +257,42 @@ if num_rounds > 1:
 # Benchmark: torch.compile vs megakernel vs eager
 # -----------------------------------------------------------------------------
 warmup = 10
+# start = torch.cuda.Event(enable_timing=True)
+# stop = torch.cuda.Event(enable_timing=True)
+# model_compile = torch.compile(model)
+# for _ in range(warmup):
+#     model_compile(sample_input)
+
+# start.record()
+# for _ in range(n_iters):
+#     model_compile(sample_input)
+# stop.record()
+# torch.cuda.synchronize()
+# print(f"[compile] {start.elapsed_time(stop) / n_iters:.3f}ms", flush=True)
+
 start = torch.cuda.Event(enable_timing=True)
 stop = torch.cuda.Event(enable_timing=True)
 
-model_compile = torch.compile(model)
-for _ in range(warmup):
-    model_compile(sample_input)
+# for i in range(warmup):
+#     mAtomics.zero_()
+#     compiled(cSchedule, cAtomics, cRms_w, cQkv_w, cWs1, cWs2,
+#              cGate_w, cUp_w, cDown_w, cOut_w, cEmbedding)
 
-start.record()
-for _ in range(n_iters):
-    model_compile(sample_input)
-stop.record()
-torch.cuda.synchronize()
-print(f"[compile] {start.elapsed_time(stop) / n_iters:.3f}ms", flush=True)
+# start.record()
+# for _ in range(n_iters):
+#     # mAtomics.zero_()
+#     output = kernel(embedding.view(batch_size * seq_len, embed_dim))
+#     torch.cuda.synchronize()
 
-start = torch.cuda.Event(enable_timing=True)
-stop = torch.cuda.Event(enable_timing=True)
 
 for i in range(warmup):
-    mAtomics.zero_()
-    compiled(cSchedule, cAtomics, cRms_w, cQkv_w, cWs1, cWs2,
-             cGate_w, cUp_w, cDown_w, cOut_w, cEmbedding)
-
+    output = kernel(embedding.view(batch_size * seq_len, embed_dim))
 start.record()
 for _ in range(n_iters):
-    mAtomics.zero_()
-    compiled(cSchedule, cAtomics, cRms_w, cQkv_w, cWs1, cWs2,
-             cGate_w, cUp_w, cDown_w, cOut_w, cEmbedding)
+    output = kernel(embedding.view(batch_size * seq_len, embed_dim))
 stop.record()
 torch.cuda.synchronize()
 print(f"[mega]    {start.elapsed_time(stop) / n_iters:.3f}ms", flush=True)
-
 # t0 = time.perf_counter_ns()
 # for _ in range(n_iters):
 #     model(sample_input)

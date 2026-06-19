@@ -27,6 +27,7 @@ class MatmulConfig:
 
     def __post_init__(self):
         self.stage_size  = (self.bM + self.bN) * self.bK
+        self.swizzle_bits = (int(math.log2(self.bK)) - 3, 4, 3)
         assert self.bM in (32, 64, 128)
         assert self.bN in (32, 64, 128)
         assert self.bK in (32, 64)
@@ -48,7 +49,7 @@ class Matmul:
         return cute.make_tiled_mma(
             warp.MmaF16BF16Op(BFloat16, Float32, (16, 8, 16)),
             (warpM, warpN, 1),
-            permutation_mnk=(self.config.bM, self.config.bN, self.config.bK),
+            permutation_mnk = (self.config.bM, self.config.bN, self.config.bK),
         )
 
     @cute.jit
@@ -107,7 +108,7 @@ class Matmul:
         cfg = self.config
         k_tiles = gA.shape[1] // cfg.bK
         tiled_mma = self._get_tiled_mma()
-        swizzle = cute.make_swizzle(3, 4, 3)
+        swizzle = cute.make_swizzle(*cfg.swizzle_bits)
 
         sA_layout = cute.make_layout(
             shape = (cfg.bM, cfg.bK, cfg.num_stages),

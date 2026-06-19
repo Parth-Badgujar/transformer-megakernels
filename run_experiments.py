@@ -12,8 +12,8 @@ import matplotlib.pyplot as plt
 import cutlass.cute as cute
 from cutlass.cute.runtime import from_dlpack
 from scheduler import get_attn_schedule
-from transformer_megakernel import LLMMegaKernel, LLMMegaKernelConfig
-from transformer_megakernel.model import MultiLayerTransformer, extract_weights
+from transformer_megakernel import LLMMegaKernel, LLMMegakernelConfig
+from transformer_megakernel.model import Transformer, extract_weights
 
 torch.manual_seed(42)
 dtype  = torch.bfloat16
@@ -39,7 +39,7 @@ def get_rms_block(seq, nsm, bM):
 
 rows_per_rms_block = get_rms_block(batch_size * seq_len, num_sms, bM=64)
 
-model = MultiLayerTransformer(
+model = Transformer(
     embed_dim, num_q_heads, num_kv_heads, ff_dim, num_layers, is_causal=is_causal
 ).cuda().eval()
 
@@ -63,7 +63,7 @@ for use_tma_reduce, output_pad, label in configs:
     print(f"  Config: use_tma_reduce={use_tma_reduce}, output_pad={output_pad}")
     print(f"{'='*60}")
 
-    cfg = LLMMegaKernelConfig(
+    cfg = LLMMegakernelConfig(
         embed_dim=embed_dim, kv_len=seq_len, q_len=seq_len,
         num_q_heads=num_q_heads, num_kv_heads=num_kv_heads,
         num_layers=num_layers, ff_dim=ff_dim, block_rms=1,

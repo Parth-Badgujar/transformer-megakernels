@@ -26,7 +26,7 @@ import torch.nn.functional as F
 import cutlass.cute as cute
 from cutlass.cute.runtime import from_dlpack
 
-from transformer_megakernel import LLMMegaKernel, LLMMegaKernelConfig
+from transformer_megakernel import LLMMegaKernel, LLMMegakernelConfig
 from scheduler import OpScheduler          # <-- rename if your file is new_scheduler.py
 
 torch.manual_seed(1436)
@@ -48,7 +48,7 @@ def get_rms_block(seq, nsm):
     return min(64, 2 ** math.floor(math.log2(seq / nsm)))
 rows_per_rms_block = get_rms_block(M, num_sms)
 
-cfg = LLMMegaKernelConfig(
+cfg = LLMMegakernelConfig(
     embed_dim=embed_dim, kv_len=seq_len, q_len=seq_len,
     num_q_heads=num_q_heads, num_kv_heads=num_kv_heads, num_layers=num_layers,
     ff_dim=ff_dim, block_rms=1, block_q=64, block_kv=64,

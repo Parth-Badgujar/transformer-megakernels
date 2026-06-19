@@ -4,17 +4,22 @@ os.environ["CUTE_DSL_LINEINFO"] = "1"
 
 from enum import IntEnum
 from dataclasses import dataclass
+import torch
 
 import cutlass
 import cutlass.cute as cute
 from cutlass.cute.nvgpu import cpasync
 from cutlass.utils import SmemAllocator
+from cutlass.cute.runtime import from_dlpack
 
 from transformer_megakernel.operators.rmsnorm import RMSNorm, RMSNormConfig
 from transformer_megakernel.operators.matmul import Matmul, MatmulConfig
 from transformer_megakernel.operators.attention import Attention, AttentionConfig
 from transformer_megakernel.operators.epilogues import basic_store, residual_add_store, silu_mul
+from transformer_megakernel.scheduler import OpScheduler
 from transformer_megakernel.kernel_utils import WarpgroupMeta, Phases, PipelineMeta
+from transformer_megakernel.model import extract_weights, Transformer
+from transformer_megakernel.config import MegakernelConfig, Op
 from cutlass import Int32, BFloat16, Uint64
 
 
@@ -39,44 +44,44 @@ from cutlass import Int32, BFloat16, Uint64
 # =============================================================================
 
 
-@dataclass
-class LLMMegaKernelConfig:
-    embed_dim:          int
-    kv_len:             int
-    q_len:              int
-    num_q_heads:        int
-    num_kv_heads:       int
-    num_layers:         int
-    ff_dim:             int
-    block_rms:          int
-    block_q:            int
-    block_kv:           int
-    num_stages:         int  = 2          # V2: two-stage
-    bM:                 int  = 128        # V2: larger M tile
-    bN:                 int  = 64
-    bK:                 int  = 64
-    bs:                 int  = 8
-    num_sms:            int  = 188
-    is_causal:          bool = False
-    use_tma_reduce:     bool = False
-    output_pad:         int  = 8          # V2: 8 so 128*(128+8)*2 = 34 KiB fits
-    warps_per_row:      int  = 1          # V2: replaces bR; num_sets = 4//warps_per_row
-    rows_per_rms_block: int  = 32
-    max_works:          int  = 0          # filled in after scheduling
+# @dataclass
+# class MegakernelConfig:
+#     embed_dim:          int
+#     kv_len:             int
+#     q_len:              int
+#     num_q_heads:        int
+#     num_kv_heads:       int
+#     num_layers:         int
+#     ff_dim:             int
+#     block_rms:          int
+#     block_q:            int
+#     block_kv:           int
+#     num_stages:         int  = 2          # V2: two-stage
+#     bM:                 int  = 128        # V2: larger M tile
+#     bN:                 int  = 64
+#     bK:                 int  = 64
+#     bs:                 int  = 8
+#     num_sms:            int  = 188
+#     is_causal:          bool = False
+#     use_tma_reduce:     bool = False
+#     output_pad:         int  = 8          # V2: 8 so 128*(128+8)*2 = 34 KiB fits
+#     warps_per_row:      int  = 1          # V2: replaces bR; num_sets = 4//warps_per_row
+#     rows_per_rms_block: int  = 16
+#     max_works:          int  = 0          # filled in after scheduling
 
 
-class Op(IntEnum):
-    RMS  = 0
-    QKV  = 1
-    ATTN = 2
-    OUT  = 3
-    GATE = 4
-    UP   = 5
-    DOWN = 6
+# class Op(IntEnum):
+#     RMS  = 0
+#     QKV  = 1
+#     ATTN = 2
+#     OUT  = 3
+#     GATE = 4
+#     UP   = 5
+#     DOWN = 6
 
 
-class LLMMegaKernel:
-    def __init__(self, config: LLMMegaKernelConfig):
+class Megakernel:
+    def __init__(self, config: MegakernelConfig):
         self.config       = config
         self.embed_dim    = config.embed_dim
         self.kv_len       = config.kv_len
@@ -112,10 +117,7 @@ class LLMMegaKernel:
 
         self.rms_config = RMSNormConfig(
             embed_dim          = self.embed_dim,
-            bRMS = self.rows_per_rms_block,
-            # num_stages         = self.num_stages,
-            # rows_per_rms_block = self.rows_per_rms_block,
-            # bM                 = self.bM,
+            bRMS               = self.rows_per_rms_block,
             stage_elements     = self.stage_elements,
             warps_per_row      = self.warps_per_row,
         )
@@ -411,7 +413,11 @@ class LLMMegaKernel:
             cute.arch.mbarrier_arrive(compute_barriers + 0)
             cute.arch.mbarrier_arrive(output_barriers + 0)
 
-        phases = Phases(compute_phase=0, input_phase=0, output_phase=0)
+        phases = Phases(
+            compute_phase = 0,
+            input_phase = 0,
+            output_phase = 0
+        )
 
         max_works_local = (self.max_works + (1 - group_id)) // 2
 
@@ -495,3 +501,68 @@ class LLMMegaKernel:
             phases.compute_phase = phases.compute_phase ^ 1
             phases.input_phase   = phases.input_phase   ^ 1
             phases.output_phase  = phases.output_phase  ^ 1
+
+
+class TransformerMegakernel:
+    def __init__(self, model: Transformer, config: MegakernelConfig):
+
+        self.config = config
+
+        # 1. Extract weights from model
+        rms_w, qkv_w, out_w, gate_w, up_w, down_w = extract_weights(model)
+
+        # 2. Build schedule
+        scheduler = OpScheduler(config)
+        sched, atoms, max_works = scheduler.build_schedule()
+        self.config.max_works = max_works
+
+        self.mSchedule = sched.cuda()
+        self.mAtomics  = atoms.cuda()
+
+        # 3. Create DLPack views
+        self.cSchedule = from_dlpack(self.mSchedule)
+        self.cAtomics  = from_dlpack(self.mAtomics)
+        self.cRms_w    = from_dlpack(rms_w,  assumed_align = 16)
+        self.cQkv_w    = from_dlpack(qkv_w,  assumed_align = 16)
+        self.cGate_w   = from_dlpack(gate_w, assumed_align = 16)
+        self.cUp_w     = from_dlpack(up_w,   assumed_align = 16)
+        self.cDown_w   = from_dlpack(down_w, assumed_align = 16)
+        self.cOut_w    = from_dlpack(out_w,  assumed_align = 16)
+
+        # 4. Allocate workspaces
+        self.num_tokens = config.bs * config.q_len
+        self.qkv_dim    = (config.num_q_heads + 2 * config.num_kv_heads) * (config.embed_dim // config.num_q_heads)
+        self.ws2_dim    = max(self.qkv_dim, config.ff_dim)
+
+        self.ws1 = torch.zeros((self.num_tokens, config.embed_dim), dtype=torch.bfloat16, device="cuda")
+        self.ws2 = torch.zeros((self.num_tokens, self.ws2_dim),     dtype=torch.bfloat16, device="cuda")
+        self.cWs1 = from_dlpack(self.ws1, assumed_align = 16)
+        self.cWs2 = from_dlpack(self.ws2, assumed_align = 16)
+
+        # 5. Compile the kernel
+        self.kernel = Megakernel(self.config)
+
+        # Dummy compilation embedding
+        dummy_emb = torch.empty((self.num_tokens, config.embed_dim), dtype=torch.bfloat16, device="cuda")
+        cDummyEmb = from_dlpack(dummy_emb, assumed_align = 16)
+
+        self.compiled_kernel = cute.compile(
+            self.kernel,
+            self.cSchedule, self.cAtomics,
+            self.cRms_w, self.cQkv_w, self.cWs1, self.cWs2,
+            self.cGate_w, self.cUp_w, self.cDown_w, self.cOut_w,
+            cDummyEmb
+        )
+
+    def __call__(self, input_embedding: torch.Tensor):
+        self.mAtomics.zero_()
+        output_embedding = input_embedding.clone()
+        cEmbedding = from_dlpack(output_embedding, assumed_align = 16)
+
+        self.compiled_kernel(
+            self.cSchedule, self.cAtomics,
+            self.cRms_w, self.cQkv_w, self.cWs1, self.cWs2,
+            self.cGate_w, self.cUp_w, self.cDown_w, self.cOut_w,
+            cEmbedding
+        )
+        return output_embedding

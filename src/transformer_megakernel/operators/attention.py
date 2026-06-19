@@ -9,8 +9,8 @@ from cutlass import Float32, BFloat16
 
 from transformer_megakernel.kernel_utils import (
     ld_acquire_u32, atomic_add_release,
-    fence_proxy_async_shared_cta, fence_proxy_async_global, WarpgroupMeta,
-    PipelineMeta, Phases
+    fence_proxy_async_shared_cta, fence_proxy_async_global, 
+    WarpgroupMeta, PipelineMeta, Phases
 )
 
 
@@ -190,9 +190,9 @@ class Attention:
             safe_max    = block_max if block_max != -Float32.inf else 0.0
 
             probs       = cute.math.exp2(
-                (scores - safe_max) * softmax_scale_log2, fastmath=True)
+                (scores - safe_max) * softmax_scale_log2, fastmath = True)
             rescale     = cute.math.exp2(
-                (prev_max - safe_max) * softmax_scale_log2, fastmath=True)
+                (prev_max - safe_max) * softmax_scale_log2, fastmath = True)
 
             output_mn[r, None].store(output_mn[r, None].load() * rescale)
             row_sum[r]  = probs.reduce(cute.ReductionOp.ADD, row_sum[r] * rescale, 0)

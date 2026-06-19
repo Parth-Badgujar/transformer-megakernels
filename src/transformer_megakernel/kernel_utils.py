@@ -1,10 +1,8 @@
-from dataclasses import dataclass
-import math
-
 import cutlass
 from cutlass._mlir import ir
 from cutlass._mlir.dialects import llvm
 from cutlass.cute.arch import dsl_user_op
+from dataclasses import dataclass
 
 @dataclass
 class WarpgroupMeta:

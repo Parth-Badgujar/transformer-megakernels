@@ -63,7 +63,7 @@ def silu_mul(*, tiled_mma, tCrC, sC, warpgroup, gC, gC_tma=None, pid_m, pid_n, b
     for n in cutlass.range_constexpr(n_tiles):
         g    = tCrC[None, None, n].load()                            # small fp32 strip
         u    = rUp[None, None, n].load().to(cutlass.Float32)         # small fp32 strip
-        silu = g / (cutlass.Float32(1.0) + cute.math.exp(-g, fastmath=True))
+        silu = g / (cutlass.Float32(1.0) + cute.math.exp(-g, fastmath = True))
         rUp[None, None, n].store((silu * u).to(cutlass.BFloat16))    # overwrite strip in place
 
     cute.copy(store_atom, thr_cpy.retile(rUp), thr_cpy.partition_D(sC))   # ONE stmatrix, full frag

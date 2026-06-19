@@ -3,11 +3,11 @@ from collections import defaultdict
 
 import torch
 
-from transformer_megakernel import LLMMegaKernelConfig, Op
+from transformer_megakernel.config import MegakernelConfig, Op
 
 
 class OpScheduler:
-    def __init__(self, config: LLMMegaKernelConfig):
+    def __init__(self, config: MegakernelConfig):
         self.num_sms = config.num_sms
         self.schedule = [[] for _ in range(self.num_sms)]
         self.atomics = []
@@ -285,14 +285,14 @@ class OpScheduler:
         )
 
 
-def get_attn_schedule(config: LLMMegaKernelConfig):
+def get_attn_schedule(config: MegakernelConfig):
     return OpScheduler(config).build_schedule()
 
 
 if __name__ == "__main__":
     import sys
 
-    cfg = LLMMegaKernelConfig(
+    cfg = MegakernelConfig(
         embed_dim=512,
         kv_len=256,
         q_len=256,
