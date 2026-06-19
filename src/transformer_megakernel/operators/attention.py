@@ -431,7 +431,8 @@ class Attention:
             cute.arch.cp_async_bulk_commit_group()
             cute.arch.cp_async_bulk_wait_group(0)
             fence_proxy_async_global()
-
+            cute.arch.sync_warp()
+            with cute.arch.elect_one():
+                atomic_add_release((mAtomics.iterator + pipeline.next_idx).toint(), 1)
         cute.arch.mbarrier_arrive(self.output_bar_ot)
-        if group_tid == 0:
-            atomic_add_release((mAtomics.iterator + pipeline.next_idx).toint(), 1)
+            

@@ -44,34 +44,34 @@ def get_rms_block(seq, num_sms, bM):
 # -----------------------------------------------------------------------------
 # Problem / config  (V2: two-stage, bM=64 for now)
 # -----------------------------------------------------------------------------
-# head_dim      = 128
-# batch_size    = 8
-# seq_len       = 512
-# num_q_heads   = 16
-# num_kv_heads  = 2
-# num_stages    = 2          # V2 is two-stage
-# is_causal     = True
-# num_layers    = 9
-# ff_dim        = 4096
-# warps_per_row = 1  # V2: replaces bR; num_sets = 4 // warps_per_row
-
 head_dim      = 128
-batch_size    = 16
-seq_len       = 256
-num_q_heads   = 4
-num_kv_heads  = 4
+batch_size    = 8
+seq_len       = 512
+num_q_heads   = 16
+num_kv_heads  = 2
 num_stages    = 2          # V2 is two-stage
 is_causal     = True
-num_layers    = 4
-ff_dim        = 512
-warps_per_row = 1 
+num_layers    = 9
+ff_dim        = 4096
+warps_per_row = 1  # V2: replaces bR; num_sets = 4 // warps_per_row
+
+# head_dim      = 128
+# batch_size    = 16
+# seq_len       = 256
+# num_q_heads   = 4
+# num_kv_heads  = 4
+# num_stages    = 2          # V2 is two-stage
+# is_causal     = True
+# num_layers    = 4
+# ff_dim        = 512
+# warps_per_row = 1 
 
 
 embed_dim  = num_q_heads * head_dim
 qkv_dim    = (num_q_heads + 2 * num_kv_heads) * head_dim
 num_tokens = batch_size * seq_len
 
-bM = 64
+bM = 128
 num_sets = 4 // warps_per_row
 rows_per_rms_block = get_rms_block(num_tokens, num_sms, bM=bM)
 # RMS tile must be a multiple of num_sets and divide bM
@@ -257,18 +257,18 @@ if num_rounds > 1:
 # Benchmark: torch.compile vs megakernel vs eager
 # -----------------------------------------------------------------------------
 warmup = 10
-# start = torch.cuda.Event(enable_timing=True)
-# stop = torch.cuda.Event(enable_timing=True)
-# model_compile = torch.compile(model)
-# for _ in range(warmup):
-#     model_compile(sample_input)
+start = torch.cuda.Event(enable_timing=True)
+stop = torch.cuda.Event(enable_timing=True)
+model_compile = torch.compile(model)
+for _ in range(warmup):
+    model_compile(sample_input)
 
-# start.record()
-# for _ in range(n_iters):
-#     model_compile(sample_input)
-# stop.record()
-# torch.cuda.synchronize()
-# print(f"[compile] {start.elapsed_time(stop) / n_iters:.3f}ms", flush=True)
+start.record()
+for _ in range(n_iters):
+    model_compile(sample_input)
+stop.record()
+torch.cuda.synchronize()
+print(f"[compile] {start.elapsed_time(stop) / n_iters:.3f}ms", flush=True)
 
 start = torch.cuda.Event(enable_timing=True)
 stop = torch.cuda.Event(enable_timing=True)

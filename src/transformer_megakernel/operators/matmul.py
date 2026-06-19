@@ -245,16 +245,12 @@ class Matmul:
 
         self.epilogue(
             tiled_mma = tiled_mma,
-            tCrC = tCrC,
-            sC = sC,
+            tCrC = tCrC, sC = sC,
             warpgroup = warpgroup,
-            gC = gC,
-            gC_tma = gC_tma,
-            pid_m = pid_m,
-            pid_n = pid_n,
-            bM = cfg.bM,
-            bN = cfg.bN,
-            use_tma_reduce=cfg.use_tma_reduce,
+            gC = gC, gC_tma = gC_tma,
+            pid_m = pid_m, pid_n = pid_n,
+            bM = cfg.bM, bN = cfg.bN,
+            use_tma_reduce = cfg.use_tma_reduce,
         )
 
         if warpgroup.warp_id == 0:
@@ -266,6 +262,7 @@ class Matmul:
             cute.arch.cp_async_bulk_commit_group()
             cute.arch.cp_async_bulk_wait_group(0)
             fence_proxy_async_global()
+            cute.arch.sync_warp()
+            with cute.arch.elect_one():
+                atomic_add_release((mAtomics.iterator + pipeline.next_idx).toint(), 1)
         cute.arch.mbarrier_arrive(output_bar_ot)
-        if warpgroup.group_tidx == 0:
-            atomic_add_release((mAtomics.iterator + pipeline.next_idx).toint(), 1)

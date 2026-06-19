@@ -274,8 +274,7 @@ class RMSNorm:
         if warp_id == 0:
             cute.arch.cp_async_bulk_wait_group(0)
             fence_proxy_async_global()
-        cute.arch.mbarrier_arrive(output_bar_ot)
-        if warp_id == 0:
-            cute.arch.cp_async_bulk_wait_group(0)
+            cute.arch.sync_warp()
             with cute.arch.elect_one():
                 atomic_add_release((mAtomics.iterator + pipeline.next_idx).toint(), cutlass.Int32(1))
+        cute.arch.mbarrier_arrive(output_bar_ot)
