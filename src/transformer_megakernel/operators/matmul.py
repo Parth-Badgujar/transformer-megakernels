@@ -24,6 +24,7 @@ class MatmulConfig:
     stage_elements: int
     output_pad: int
     use_tma_reduce: bool
+    group_m = 8
 
     def __post_init__(self):
         self.stage_size  = (self.bM + self.bN) * self.bK

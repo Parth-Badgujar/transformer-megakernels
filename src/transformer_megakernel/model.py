@@ -3,7 +3,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 class RMSNormLayer(nn.Module):
-    def __init__(self, dim, dtype = torch.bfloat16, device = "cuda"):
+    def __init__(
+        self, dim: int,
+        dtype: torch.dtype = torch.bfloat16,
+        device: str | torch.device = "cuda"
+    ):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(dim, dtype = dtype, device = device))
 
@@ -22,7 +26,7 @@ class GroupedQueryAttention(nn.Module):
         num_kv_heads: int,
         is_causal: bool = False,
         dtype: torch.dtype = torch.bfloat16,
-        device: str = "cuda"
+        device: str | torch.device = "cuda"
     ):
         super().__init__()
         self.embed_dim    = embed_dim
@@ -54,7 +58,7 @@ class GroupedQueryAttention(nn.Module):
 class SwiGLU(nn.Module):
     def __init__(
         self,
-        dim: int, 
+        dim: int,
         ff_dim: int,
         bias: bool = False,
         dtype: torch.dtype = torch.bfloat16,
@@ -72,18 +76,19 @@ class SwiGLU(nn.Module):
 class TransformerLayer(nn.Module):
     def __init__(
         self,
-        embed_dim: int, 
+        embed_dim: int,
         num_q_heads: int,
         num_kv_heads: int,
         ff_dim: int,
         is_causal: bool = False,
-        dtype: torch.dtype = torch.bfloat16
+        dtype: torch.dtype = torch.bfloat16,
+        device: str | torch.device = "cuda"
     ):
         super().__init__()
-        self.norm1 = RMSNormLayer(embed_dim, dtype = dtype)
-        self.attention  = GroupedQueryAttention(embed_dim, num_q_heads, num_kv_heads, is_causal, dtype = dtype)
-        self.norm2 = RMSNormLayer(embed_dim, dtype = dtype)
-        self.feedforward   = SwiGLU(embed_dim, ff_dim, dtype = dtype)
+        self.norm1 = RMSNormLayer(embed_dim, dtype = dtype, device = device)
+        self.attention  = GroupedQueryAttention(embed_dim, num_q_heads, num_kv_heads, is_causal, dtype = dtype, device = device)
+        self.norm2 = RMSNormLayer(embed_dim, dtype = dtype, device = device)
+        self.feedforward   = SwiGLU(embed_dim, ff_dim, dtype = dtype, device = device)
 
     def forward(self, x: torch.Tensor):
         residual = x
@@ -106,12 +111,12 @@ class Transformer(nn.Module):
         num_layers: int,
         is_causal: bool = False,
         dtype: torch.dtype = torch.bfloat16,
-        device: str = "cuda"
+        device: str | torch.device = "cuda"
     ):
         super().__init__()
         self.layers = nn.ModuleList([
             TransformerLayer(
-                embed_dim, num_q_heads, num_kv_heads, ff_dim, is_causal, dtype = dtype
+                embed_dim, num_q_heads, num_kv_heads, ff_dim, is_causal, dtype = dtype, device = device
             )
             for _ in range(num_layers)
         ])
@@ -129,9 +134,9 @@ def extract_weights(model: Transformer):
     gate_w = []
     up_w = []
     down_w = []
-    
+
     get_raw_clone = lambda x: x.weight.detach().clone()
-    
+
     for layer in model.layers:
         rms_w.append(get_raw_clone(layer.norm1))
         rms_w.append(get_raw_clone(layer.norm2))

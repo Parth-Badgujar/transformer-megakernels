@@ -1,4 +1,4 @@
 from .megakernel import Megakernel, TransformerMegakernel
-from .config import MegakernelConfig, Op
+from .config import InputConfig, KernelConfig, Op
 
-__all__ = ["Megakernel", "MegakernelConfig", "Op", "TransformerMegakernel"]
+__all__ = ["Megakernel", "InputConfig", "KernelConfig", "Op", "TransformerMegakernel"]

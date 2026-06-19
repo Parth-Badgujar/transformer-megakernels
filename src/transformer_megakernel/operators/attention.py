@@ -435,4 +435,3 @@ class Attention:
             with cute.arch.elect_one():
                 atomic_add_release((mAtomics.iterator + pipeline.next_idx).toint(), 1)
         cute.arch.mbarrier_arrive(self.output_bar_ot)
-            

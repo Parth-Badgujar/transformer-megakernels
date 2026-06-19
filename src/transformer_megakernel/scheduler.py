@@ -3,35 +3,74 @@ from collections import defaultdict
 
 import torch
 
-from transformer_megakernel.config import MegakernelConfig, Op
+from transformer_megakernel.config import Op, InputConfig, KernelConfig
+from transformer_megakernel.operators.matmul import MatmulConfig
 
+class Matmul():
+    def __init__(self, config: MatmulConfig, M, K, N):
+        self.bM = config.bM
+        self.bN = config.bN
+        self.bK = config.bK
+        self.input_tiler = (self.bM, self.bK)
+        self.output_tiler = (self.bM, self.bN)
+    
+    def _compute_pid(self, block_id, total_pid, total_pid_m, group_size_m = 8):
+        total_pid_n = total_pid // total_pid_m
+        gsm = min(group_size_m, total_pid_m)
+        grp = gsm * total_pid_n
+        g = block_id // grp
+        fm = g * gsm
+        sz = min(total_pid_m - fm, gsm)
+        pid_m = fm + block_id % sz
+        pid_n = (block_id % grp) // sz
+        return pid_m, pid_n
+
+    def tiles(self, prev_sm, prev_tiles):
+    
 
 class OpScheduler:
-    def __init__(self, config: MegakernelConfig):
-        self.num_sms = config.num_sms
+    def __init__(self, input_config, kernel_config: KernelConfig):
+        self.num_sms = kernel_config.num_sms
+        self.schedule = []
+        self.atomics = []
+        self.input_config = input_config
+        self.kernel_config = kernel_config
+        self.current_deps = []
+    def add_operations(self, ops: list):
+        for op in ops:
+            self.add_operation(op)
+    
+    def add_operation(self, op):
+        
+    
+        
+
+class OpScheduler:
+    def __init__(self, input_config: InputConfig, kernel_config: KernelConfig):
+        self.num_sms = kernel_config.num_sms
         self.schedule = [[] for _ in range(self.num_sms)]
         self.atomics = []
 
-        self.bs = config.bs
-        self.q_len = config.q_len
+        self.bs = input_config.bs
+        self.q_len = input_config.q_len
         self.M = self.bs * self.q_len
 
-        self.E = config.embed_dim
-        self.num_q_heads = config.num_q_heads
-        self.num_kv_heads = config.num_kv_heads
-        self.head_dim = config.embed_dim // config.num_q_heads
-        self.Qd = (config.num_q_heads + 2 * config.num_kv_heads) * self.head_dim
-        self.F = config.ff_dim
-        self.num_layers = config.num_layers
+        self.E = input_config.embed_dim
+        self.num_q_heads = input_config.num_q_heads
+        self.num_kv_heads = input_config.num_kv_heads
+        self.head_dim = input_config.embed_dim // input_config.num_q_heads
+        self.Qd = (input_config.num_q_heads + 2 * input_config.num_kv_heads) * self.head_dim
+        self.F = input_config.ff_dim
+        self.num_layers = input_config.num_layers
 
-        self.bM = config.bM
-        self.bN = config.bN
-        self.block_q = config.block_q
+        self.bM = kernel_config.bM
+        self.bN = kernel_config.bN
+        self.block_q = kernel_config.block_q
 
         self.Mout = int(math.ceil(self.M / self.bM))
         assert self.q_len % self.bM == 0, "bM must divide q_len"
 
-        self.rows_per_rms_block = config.rows_per_rms_block
+        self.rows_per_rms_block = kernel_config.rows_per_rms_block
         assert self.bM % self.rows_per_rms_block == 0, (
             "rows_per_rms_block must divide bM"
         )
@@ -285,70 +324,70 @@ class OpScheduler:
         )
 
 
-def get_attn_schedule(config: MegakernelConfig):
+def get_attn_schedule(config):
     return OpScheduler(config).build_schedule()
 
 
 if __name__ == "__main__":
     import sys
+    pass
+    # cfg = MegakernelConfig(
+    #     embed_dim=512,
+    #     kv_len=256,
+    #     q_len=256,
+    #     num_q_heads=4,
+    #     num_kv_heads=4,
+    #     num_layers=4,
+    #     ff_dim=1024,
+    #     block_rms=1,
+    #     block_q=64,
+    #     block_kv=64,
+    #     num_stages=2,
+    #     bM=128,
+    #     bN=128,
+    #     bK=64,
+    #     bs=16,
+    #     num_sms=188,
+    #     output_pad=8,
+    #     warps_per_row=1,
+    #     rows_per_rms_block=int(sys.argv[1]) if len(sys.argv) > 1 else 32,
+    # )
 
-    cfg = MegakernelConfig(
-        embed_dim=512,
-        kv_len=256,
-        q_len=256,
-        num_q_heads=4,
-        num_kv_heads=4,
-        num_layers=4,
-        ff_dim=1024,
-        block_rms=1,
-        block_q=64,
-        block_kv=64,
-        num_stages=2,
-        bM=128,
-        bN=128,
-        bK=64,
-        bs=16,
-        num_sms=188,
-        output_pad=8,
-        warps_per_row=1,
-        rows_per_rms_block=int(sys.argv[1]) if len(sys.argv) > 1 else 32,
-    )
+    # scheduler = OpScheduler(cfg)
+    # schedule_tensor, atomics_tensor, max_works = scheduler.build_schedule()
+    # print(
+    #     f"M={scheduler.M}, bM={scheduler.bM}, "
+    #     f"rows_per_rms_block={scheduler.rows_per_rms_block}, "
+    #     f"tpg={scheduler.tpg}, Mout={scheduler.Mout}, "
+    #     f"Mtiles_per_RMS={scheduler.Mtiles}"
+    # )
+    # print(
+    #     f"num_sms={scheduler.num_sms}, max_works_per_SM={max_works}, "
+    #     f"total_atomics={len(scheduler.atomics)}"
+    # )
 
-    scheduler = OpScheduler(cfg)
-    schedule_tensor, atomics_tensor, max_works = scheduler.build_schedule()
-    print(
-        f"M={scheduler.M}, bM={scheduler.bM}, "
-        f"rows_per_rms_block={scheduler.rows_per_rms_block}, "
-        f"tpg={scheduler.tpg}, Mout={scheduler.Mout}, "
-        f"Mtiles_per_RMS={scheduler.Mtiles}"
-    )
-    print(
-        f"num_sms={scheduler.num_sms}, max_works_per_SM={max_works}, "
-        f"total_atomics={len(scheduler.atomics)}"
-    )
+    # schedule = schedule_tensor.tolist()
+    # next_idx_map = defaultdict(list)
+    # for li, lst in enumerate(schedule):
+    #     for ii, node in enumerate(lst):
+    #         next_idx_map[node[-1]].append((li, ii))
 
-    schedule = schedule_tensor.tolist()
-    next_idx_map = defaultdict(list)
-    for li, lst in enumerate(schedule):
-        for ii, node in enumerate(lst):
-            next_idx_map[node[-1]].append((li, ii))
-
-    violations = []
-    for li, lst in enumerate(schedule):
-        for ii, node in enumerate(lst):
-            atomic_cnt, prev_idx = node[-3], node[-2]
-            if atomic_cnt > 0:
-                actual = len(next_idx_map.get(prev_idx, []))
-                if actual != atomic_cnt:
-                    violations.append(
-                        f"  list={li} item={ii} op={node[0] & 0x7} layer={node[0] >> 3} "
-                        f"pid_m={node[1]} pid_n={node[2]} pid_o={node[3]}: "
-                        f"expected_cnt={atomic_cnt} but {actual} predecessors "
-                        f"write to atomic[{prev_idx}]"
-                    )
-    if violations:
-        print(f"FAIL: {len(violations)} dependency violations")
-        for v in violations[:10]:
-            print(v)
-    else:
-        print("SUCCESS: dependency graph valid.")
+    # violations = []
+    # for li, lst in enumerate(schedule):
+    #     for ii, node in enumerate(lst):
+    #         atomic_cnt, prev_idx = node[-3], node[-2]
+    #         if atomic_cnt > 0:
+    #             actual = len(next_idx_map.get(prev_idx, []))
+    #             if actual != atomic_cnt:
+    #                 violations.append(
+    #                     f"  list={li} item={ii} op={node[0] & 0x7} layer={node[0] >> 3} "
+    #                     f"pid_m={node[1]} pid_n={node[2]} pid_o={node[3]}: "
+    #                     f"expected_cnt={atomic_cnt} but {actual} predecessors "
+    #                     f"write to atomic[{prev_idx}]"
+    #                 )
+    # if violations:
+    #     print(f"FAIL: {len(violations)} dependency violations")
+    #     for v in violations[:10]:
+    #         print(v)
+    # else:
+    #     print("SUCCESS: dependency graph valid.")
