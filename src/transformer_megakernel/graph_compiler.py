@@ -4,8 +4,44 @@ import numpy as np
 from numpy.lib.stride_tricks import as_strided
 from enum import IntEnum
 import math
+import islpy as isl
+
 # from transformer_megakernel.config import Op
 # from transformer_megakernel.operators.matmul import MatmulConfig
+
+def build_isl_map_str(shape: tuple, stride: tuple, tiler: tuple, index: tuple, offset: int) -> str:
+    """
+    Dynamically generates an ISL polyhedral map string for an N-dimensional tile,
+    incorporating an absolute memory offset.
+    """
+    ndims = len(shape)
+    
+    # 1. Generate variable names: c0, c1, c2, ...
+    vars_list = [f"c{i}" for i in range(ndims)]
+    vars_str = ", ".join(vars_list)
+    
+    # 2. Generate the flat memory offset equation, starting with the base offset
+    offset_terms = [f"{vars_list[i]}*{stride[i]}" for i in range(ndims)]
+    offset_expr = str(offset)
+    if offset_terms:
+        offset_expr += " + " + " + ".join(offset_terms)
+    
+    # 3. Generate the strict tile boundaries
+    bounds = []
+    for i in range(ndims):
+        start = index[i] * tiler[i]
+        end = min((index[i] + 1) * tiler[i], shape[i]) # Prevent out-of-bounds
+        
+        # If the tile index is completely outside the parent shape, return an empty set
+        if start >= end:
+            return f"{{ [{vars_str}] -> [offset] : 1 = 0 }}"
+            
+        bounds.append(f"{start} <= {vars_list[i]} < {end}")
+        
+    bounds_str = " and ".join(bounds) if bounds else "1 = 1"
+    
+    # 4. Assemble the final ISL string
+    return f"{{ [{vars_str}] -> [offset] : offset = {offset_expr} and {bounds_str} }}"
 
 class Op(IntEnum):
     RMS = 0
@@ -84,25 +120,32 @@ class AtomicState:
 @dataclass
 class TensorPartition:
     parent: Tensor
-    tiler: tuple[int]
-    index: tuple[int]
-
-    def __post_init__(self):
-        itemsize = self.parent._base.itemsize
-
-        self._np_tile = as_strided(
-            self.parent._base,
-            shape = self.parent.shape,
-            strides = tuple(s * itemsize for s in self.parent.stride)
-        )
-        slices = tuple(
-            slice(idx * tile_size, (idx + 1) * tile_size) 
-            for idx, tile_size in zip(self.index, self.tiler)
-        )
-        self._partition = self._np_tile[slices]
+    tiler: tuple[int, ...]
+    index: tuple[int, ...]
+    offset: int = 0
 
     def intersect(self, other: TensorPartition) -> bool:
-        return np.shares_memory(self._partition, other._partition)
+        map_a_str = build_isl_map_str(
+            shape=self.parent.shape, 
+            stride=self.parent.stride, 
+            tiler=self.tiler, 
+            index=self.index,
+            offset=self.offset
+        )
+        map_b_str = build_isl_map_str(
+            shape=other.parent.shape, 
+            stride=other.parent.stride, 
+            tiler=other.tiler, 
+            index=other.index,
+            offset=other.offset
+        )
+        
+        map_a = isl.Map(map_a_str)
+        map_b = isl.Map(map_b_str)
+        
+        intersection = map_a.range().intersect(map_b.range())
+        
+        return not intersection.is_empty()
     
     def __repr__(self):
         return (
@@ -111,7 +154,8 @@ class TensorPartition:
             f"    shape={self.parent.shape},\n"
             f"    stride={self.parent.stride},\n"
             f"    tiler={self.tiler},\n"
-            f"    index={self.index}\n"
+            f"    index={self.index},\n"
+            f"    offset={self.offset}\n"
             f")"
         )
 
@@ -173,7 +217,7 @@ class TileOP:
         self.op: Op
     def __call__(self, *args, **kwargs) -> Tensor:
         pass
-    
+
     def add_atomic(self, curr_compute_tile, next_compute_tile, atomics: AtomicState):
         if curr_compute_tile.next_atomic is not None:
             next_compute_tile.prev_atomic = curr_compute_tile.next_atomic
@@ -184,11 +228,12 @@ class TileOP:
             next_compute_tile.prev_atomic = atomics.atomic_index
             atomics.atomic_index += 1
 
+
 class Matmul(TileOP):
-    def __init__(self, 
-        M: int, N: int, K: int, 
-        layer_idx: int, 
-        config: MatmulConfig, 
+    def __init__(self,
+        M: int, N: int, K: int,
+        layer_idx: int,
+        config: MatmulConfig,
         op_kind: Op
     ):
         self.M = M
@@ -216,10 +261,10 @@ class Matmul(TileOP):
             yield pid_m, pid_n
             block_id += 1
 
-    def __call__(self, 
-        A: Tensor, 
-        B: Tensor, 
-        atomic_state: AtomicState, 
+    def __call__(self,
+        A: Tensor,
+        B: Tensor,
+        atomic_state: AtomicState,
         C: Tensor = None
     ):
         M, K = A.shape[0], A.shape[1]
@@ -320,24 +365,28 @@ class Attention(TileOP):
 
     def __call__(self, QKV: Tensor, atomic_state: AtomicState):
         batch_size = QKV.shape[0]
-        num_heads = self.num_q_heads
-        q_len = QKV.shape[1]
-        head_dim = self.head_dim
+        seq_len    = QKV.shape[1]
+        packed_qkv = QKV.shape[2]
+        num_heads  = self.num_q_heads
+        embed_dim  = num_heads * self.head_dim
+        
+        out = Tensor(
+            shape = (batch_size, seq_len, embed_dim),
+            stride = (seq_len * embed_dim, embed_dim, 1),
+            is_weight = False
+        )
 
-        out = Tensor(shape = (batch_size, q_len, num_heads, head_dim), 
-            stride = (q_len * num_heads * head_dim, num_heads * head_dim, head_dim, 1), 
-            is_weight = False)
         QKV.set_input_op(self)
         out.set_output_op(self)
 
         for pid_b in range(batch_size):
             for pid_h in range(num_heads):
-                for pid_q in range(q_len // self.bQ):
+                for pid_q in range(seq_len // self.bQ):
                     self.compute_tiles.append(
                         ComputeTile(
                             op = self.op,
-                            input_tile = TensorPartition(QKV, (1, 1, self.bQ, self.head_dim), (pid_b, pid_h, pid_q, 0)),
-                            output_tile = TensorPartition(out, (1, self.bQ, self.num_q_heads, self.head_dim), (pid_b, pid_q, pid_h, 0)),
+                            input_tile = TensorPartition(QKV, (1, self.bQ, packed_qkv), (pid_b, pid_q, 0)),
+                            output_tile = TensorPartition(out, (1, self.bQ, embed_dim), (pid_b, pid_q, 0)),
                             pid_m = pid_b,
                             pid_n = pid_h,
                             pid_k = pid_q,
@@ -421,7 +470,7 @@ output_tensor = matmul1(input_tensor, weight1_tensor, atomic_state)
 output2_tensor = matmul2(output_tensor, weight2_tensor, atomic_state)
 output3_tensor = rmsnorm1(output2_tensor, weight3_tensor, atomic_state)
 output4_tensor = matmul3(output3_tensor, weight2_tensor, atomic_state)
-output5_tensor = 
+output5_tensor =
 # for tile in matmul1.compute_tiles:
 #     print(tile)
 #     print("Next atomic :", tile.next_atomic)

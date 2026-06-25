@@ -4,46 +4,7 @@ from collections import defaultdict
 import torch
 
 from transformer_megakernel.config import Op, InputConfig, KernelConfig
-from transformer_megakernel.operators.matmul import MatmulConfig
 
-class Matmul():
-    def __init__(self, config: MatmulConfig, M, K, N):
-        self.bM = config.bM
-        self.bN = config.bN
-        self.bK = config.bK
-        self.input_tiler = (self.bM, self.bK)
-        self.output_tiler = (self.bM, self.bN)
-    
-    def _compute_pid(self, block_id, total_pid, total_pid_m, group_size_m = 8):
-        total_pid_n = total_pid // total_pid_m
-        gsm = min(group_size_m, total_pid_m)
-        grp = gsm * total_pid_n
-        g = block_id // grp
-        fm = g * gsm
-        sz = min(total_pid_m - fm, gsm)
-        pid_m = fm + block_id % sz
-        pid_n = (block_id % grp) // sz
-        return pid_m, pid_n
-
-    def tiles(self, prev_sm, prev_tiles):
-    
-
-class OpScheduler:
-    def __init__(self, input_config, kernel_config: KernelConfig):
-        self.num_sms = kernel_config.num_sms
-        self.schedule = []
-        self.atomics = []
-        self.input_config = input_config
-        self.kernel_config = kernel_config
-        self.current_deps = []
-    def add_operations(self, ops: list):
-        for op in ops:
-            self.add_operation(op)
-    
-    def add_operation(self, op):
-        
-    
-        
 
 class OpScheduler:
     def __init__(self, input_config: InputConfig, kernel_config: KernelConfig):
@@ -331,7 +292,7 @@ def get_attn_schedule(config):
 if __name__ == "__main__":
     import sys
     pass
-    # cfg = MegakernelConfig(
+    # cfg = KernelConfig(
     #     embed_dim=512,
     #     kv_len=256,
     #     q_len=256,

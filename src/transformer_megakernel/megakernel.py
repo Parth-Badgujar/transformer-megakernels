@@ -17,13 +17,23 @@ from transformer_megakernel.operators.epilogues import basic_store, residual_add
 from transformer_megakernel.scheduler import OpScheduler
 from transformer_megakernel.model import extract_weights, Transformer
 from transformer_megakernel.config import InputConfig, KernelConfig, Op
-from transformer_megakernel.kernel_utils import WarpgroupMeta, Phases, PipelineMeta
+from transformer_megakernel.kernel_utils import (
+    WarpgroupMeta, Phases, PipelineMeta,
+    PROBE_HEADER, PROBE_ENTRY, MAX_TAG_SLOTS, NUM_PROBE_ROLES,
+    ROLE_NAMES, TAG_NAMES, TAGS,
+    dump_probe,
+)
 
 from cutlass import Int32, BFloat16, Uint64
 
+# Required probe tensor column count: PROBE_HEADER + MAX_TAG_SLOTS * PROBE_ENTRY
+PROBE_COLS = PROBE_HEADER + MAX_TAG_SLOTS * PROBE_ENTRY  # = 1 + 16*4 = 65
+
 
 class Megakernel:
-    def __init__(self, input_config: InputConfig, kernel_config: KernelConfig):
+    def __init__(self, input_config: InputConfig, kernel_config: KernelConfig,
+                 profile: bool = False):
+        self.profile      = profile
         self.embed_dim    = input_config.embed_dim
         self.kv_len       = input_config.kv_len
         self.q_len        = input_config.q_len
@@ -86,7 +96,6 @@ class Megakernel:
             output_pad = self.output_pad,
             is_causal = input_config.is_causal
         )
-
     @cute.jit
     def _get_shared_storage(self):
         num_out_elements = max(
@@ -126,6 +135,7 @@ class Megakernel:
         mDown_proj:   cute.Tensor,
         mOutProjAttn: cute.Tensor,
         mEmbedding:   cute.Tensor,
+        mProbe: cute.Tensor
     ):
         q_layout  = cute.make_layout(
             shape  = (self.bs, self.num_q_heads,  self.q_len, self.head_dim),
@@ -248,17 +258,17 @@ class Megakernel:
         tma_DOWN_out, g_DOWN_out = cpasync.make_tiled_tma_atom(store_op_red, mEmbed_st,  matmul_C_pad, (self.bM, 1, self.bN + self.output_pad))
         g_DOWN_out_nt = mEmbedding
 
-        self.rmsnorm = RMSNorm(self.rms_config)
-        self.qkv     = Matmul(self.matmul_config, basic_store)
-        self.out     = Matmul(self.matmul_config, residual_add_store)
-        self.up      = Matmul(self.matmul_config, basic_store)
-        self.gate    = Matmul(self.matmul_config, silu_mul)
-        self.down    = Matmul(self.matmul_config, residual_add_store)
-        self.attn    = Attention(self.attention_config)
+        self.rmsnorm = RMSNorm(self.rms_config,  profile=self.profile)
+        self.qkv     = Matmul(self.matmul_config, basic_store,          profile=self.profile)
+        self.out     = Matmul(self.matmul_config, residual_add_store,   profile=self.profile)
+        self.up      = Matmul(self.matmul_config, basic_store,          profile=self.profile)
+        self.gate    = Matmul(self.matmul_config, silu_mul,             profile=self.profile)
+        self.down    = Matmul(self.matmul_config, residual_add_store,   profile=self.profile)
+        self.attn    = Attention(self.attention_config,                  profile=self.profile)
 
         SharedStorage = self._get_shared_storage()
 
-        self.kernel(mSchedule, mAtomics,
+        self.kernel(mProbe, mSchedule, mAtomics,
                 g_RMS_inp, g_RMS_out, mRMS_weights,
                 g_QKV_inp, g_QKV_act, g_QKV_wt,
                 g_OUT_inp, g_OUT_out, g_OUT_wt, g_OUT_out_nt,
@@ -280,6 +290,7 @@ class Megakernel:
 
     @cute.kernel
     def kernel(self,
+        mProbe: cute.Tensor,
         mSchedule: cute.Tensor,
         mAtomics: cute.Tensor,
         g_RMS_inp: cute.Tensor, g_RMS_out: cute.Tensor, mRMS_weights: cute.Tensor,
@@ -397,6 +408,7 @@ class Megakernel:
                     rms_w_idx, pid_m, 
                     mAtomics, pipeline, phases,
                     warpgroup, storage,
+                    mProbe
                 )
             elif op_kind == int(Op.QKV):
                 self.qkv.run(
@@ -405,6 +417,7 @@ class Megakernel:
                     layer_idx, pid_m, pid_n,
                     mAtomics, pipeline, phases,
                     warpgroup, storage,
+                    mProbe
                 )
             elif op_kind == int(Op.ATTN):
                 self.attn.run(
@@ -412,6 +425,7 @@ class Megakernel:
                     pid_m, pid_n, pid_o,
                     mAtomics, pipeline, phases,
                     warpgroup, storage,
+                    mProbe
                 )
             elif op_kind == int(Op.OUT):
                 self.out.run(
@@ -420,6 +434,7 @@ class Megakernel:
                     layer_idx, pid_m, pid_n,
                     mAtomics, pipeline, phases,
                     warpgroup, storage,
+                    mProbe
                 )
             elif op_kind == int(Op.UP):
                 self.up.run(
@@ -428,6 +443,7 @@ class Megakernel:
                     layer_idx, pid_m, pid_n,
                     mAtomics, pipeline, phases,
                     warpgroup, storage,
+                    mProbe
                 )
             elif op_kind == int(Op.GATE):
                 self.gate.run(
@@ -436,6 +452,7 @@ class Megakernel:
                     layer_idx, pid_m, pid_n,
                     mAtomics, pipeline, phases,
                     warpgroup, storage,
+                    mProbe
                 )
             elif op_kind == int(Op.DOWN):
                 self.down.run(
@@ -444,6 +461,7 @@ class Megakernel:
                     layer_idx, pid_m, pid_n,
                     mAtomics, pipeline, phases,
                     warpgroup, storage,
+                    mProbe
                 )
 
             phases.compute_phase = phases.compute_phase ^ 1
@@ -452,7 +470,10 @@ class Megakernel:
 
 
 class TransformerMegakernel:
-    def __init__(self, model: Transformer, input_config: InputConfig, kernel_config: KernelConfig):
+    def __init__(self, model: Transformer, input_config: InputConfig,
+                 kernel_config: KernelConfig, profile: bool = False):
+        self.profile    = profile
+        self.num_sms    = kernel_config.num_sms
 
         # 1. Extract weights from model
         rms_w, qkv_w, out_w, gate_w, up_w, down_w = extract_weights(model)
@@ -484,8 +505,16 @@ class TransformerMegakernel:
         self.cWs1 = from_dlpack(self.ws1, assumed_align = 16)
         self.cWs2 = from_dlpack(self.ws2, assumed_align = 16)
 
-        # 5. Compile the kernel
-        self.kernel = Megakernel(input_config, kernel_config)
+        # 5. Allocate probe tensor (always, but only populated when profile=True)
+        #    Shape: (num_sms * NUM_PROBE_ROLES, PROBE_COLS)  — int64 so timestamps fit
+        num_probe_rows = kernel_config.num_sms * NUM_PROBE_ROLES
+        self.mProbe = torch.zeros(
+            (num_probe_rows, PROBE_COLS), dtype=torch.int64, device="cuda"
+        )
+        self.cProbe = from_dlpack(self.mProbe, assumed_align = 16)
+
+        # 6. Compile the kernel
+        self.kernel = Megakernel(input_config, kernel_config, profile=profile)
 
         # Dummy compilation embedding
         dummy_emb = torch.empty((self.num_tokens, input_config.embed_dim), dtype=torch.bfloat16, device="cuda")
@@ -496,11 +525,14 @@ class TransformerMegakernel:
             self.cSchedule, self.cAtomics,
             self.cRms_w, self.cQkv_w, self.cWs1, self.cWs2,
             self.cGate_w, self.cUp_w, self.cDown_w, self.cOut_w,
-            cDummyEmb
+            cDummyEmb, self.cProbe
         )
 
-    def __call__(self, input_embedding: torch.Tensor):
+    def __call__(self, input_embedding: torch.Tensor,
+                 trace_path: str = "pipeline_trace.json"):
         self.mAtomics.zero_()
+        if self.profile:
+            self.mProbe.zero_()
         output_embedding = input_embedding.clone()
         cEmbedding = from_dlpack(output_embedding, assumed_align = 16)
 
@@ -508,6 +540,11 @@ class TransformerMegakernel:
             self.cSchedule, self.cAtomics,
             self.cRms_w, self.cQkv_w, self.cWs1, self.cWs2,
             self.cGate_w, self.cUp_w, self.cDown_w, self.cOut_w,
-            cEmbedding
+            cEmbedding, self.cProbe
         )
+
+        if self.profile:
+            torch.cuda.synchronize()
+            dump_probe(self.mProbe, self.num_sms, out_path=trace_path)
+
         return output_embedding

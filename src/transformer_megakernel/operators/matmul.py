@@ -12,7 +12,8 @@ from transformer_megakernel.kernel_utils import (
     ld_acquire_u32,
     atomic_add_release,
     fence_proxy_async_global,
-    WarpgroupMeta, PipelineMeta, Phases
+    WarpgroupMeta, PipelineMeta, Phases,
+    range_start, range_stop, range_finalize, TAGS
 )
 
 @dataclass
@@ -38,9 +39,10 @@ class MatmulConfig:
 
 
 class Matmul:
-    def __init__(self, config: MatmulConfig, epilogue: Callable):
+    def __init__(self, config: MatmulConfig, epilogue: Callable, profile = False):
         self.config   = config
         self.epilogue = epilogue
+        self.profile = profile
 
     @cute.jit
     def _get_tiled_mma(self) -> cute.TiledMma:
@@ -105,6 +107,7 @@ class Matmul:
         phases: Phases,
         warpgroup: WarpgroupMeta,
         storage,
+        mProbe: cute.Tensor
     ):
         cfg = self.config
         k_tiles = gA.shape[1] // cfg.bK
@@ -208,25 +211,54 @@ class Matmul:
         stage      = stage_cell[0]
         load_phase = phase_cell[0]
 
-        # ---- prologue: prefetch a SINGLE stage ----
+        # ---- prologue: issue LOAD_A and LOAD_B in parallel, then wait ----
         expect_tx(stage)
+        # Both async loads start concurrently — open both ranges before either completes.
+        if cutlass.const_expr(self.profile) and warpgroup.group_tidx == 0:
+            range_start(mProbe, warpgroup.group_id,
+                        cute.arch.block_idx()[0], TAGS["LOAD_B"])
         load_B(stage, 0)
-        if warpgroup.warp_id == 0:
+        if cutlass.const_expr(self.profile) and warpgroup.group_tidx == 0:
+            range_start(mProbe, warpgroup.group_id,
+                        cute.arch.block_idx()[0], TAGS["LOAD_A"])
+        load_A(stage, 0)
+        prefetch_stage = (stage + 1) % cfg.num_stages
+        cute.arch.mbarrier_wait(compute_bar_me, phases.compute_phase)
+
+        # ---- pipeline dependency wait (spin on atomics for the current tile) ----
+        if warpgroup.group_tidx == 0:
             with cute.arch.elect_one():
                 ready = 0
                 while ready != pipeline.expected_cnt:
                     ready = ld_acquire_u32((mAtomics.iterator + pipeline.current_idx).toint())
             cute.arch.sync_warp()
-        load_A(stage, 0)
-        prefetch_stage = (stage + 1) % cfg.num_stages
-        cute.arch.mbarrier_wait(compute_bar_me, phases.compute_phase)
+
+        # Both loads have now completed — close both ranges.
+        if cutlass.const_expr(self.profile) and warpgroup.group_tidx == 0:
+            range_stop(mProbe, warpgroup.group_id, TAGS["LOAD_A"])
+            range_stop(mProbe, warpgroup.group_id, TAGS["LOAD_B"])
+
         # ---- mainloop: k_tiles-1 iterations, each prefetches the next tile ----
         for k_tile in cutlass.range(0, k_tiles - 1):
             expect_tx(prefetch_stage)
+            # Prefetch A and B for the next tile (parallel async loads)
+            if cutlass.const_expr(self.profile) and warpgroup.group_tidx == 0:
+                range_start(mProbe, warpgroup.group_id,
+                            cute.arch.block_idx()[0], TAGS["LOAD_A"])
+                range_start(mProbe, warpgroup.group_id,
+                            cute.arch.block_idx()[0], TAGS["LOAD_B"])
             load_A(prefetch_stage, k_tile + 1)
             load_B(prefetch_stage, k_tile + 1)
             load_phase = wait_stage(stage, load_phase)
+            # Current tile is ready — stop prefetch ranges and start compute
+            if cutlass.const_expr(self.profile) and warpgroup.group_tidx == 0:
+                range_stop(mProbe, warpgroup.group_id, TAGS["LOAD_A"])
+                range_stop(mProbe, warpgroup.group_id, TAGS["LOAD_B"])
+                range_start(mProbe, warpgroup.group_id,
+                            cute.arch.block_idx()[0], TAGS["COMPUTE_AB"])
             gemm(stage)
+            if cutlass.const_expr(self.profile) and warpgroup.group_tidx == 0:
+                range_stop(mProbe, warpgroup.group_id, TAGS["COMPUTE_AB"])
             stage          = (stage + 1) % cfg.num_stages
             prefetch_stage = (prefetch_stage + 1) % cfg.num_stages
 
@@ -239,11 +271,19 @@ class Matmul:
         # ---- single trailing gemm ----
         cute.arch.mbarrier_arrive(input_bar_ot)
         load_phase = wait_stage(stage, load_phase)
+        if cutlass.const_expr(self.profile) and warpgroup.group_tidx == 0:
+            range_start(mProbe, warpgroup.group_id,
+                        cute.arch.block_idx()[0], TAGS["COMPUTE_AB"])
         gemm(stage)
+        if cutlass.const_expr(self.profile) and warpgroup.group_tidx == 0:
+            range_stop(mProbe, warpgroup.group_id, TAGS["COMPUTE_AB"])
+
         # ---- epilogue into the output section, after the output barrier ----
         cute.arch.mbarrier_wait(output_bar_me, phases.output_phase)
         cute.arch.mbarrier_arrive(compute_bar_ot)
-
+        if cutlass.const_expr(self.profile) and warpgroup.group_tidx == 0:
+            range_start(mProbe, warpgroup.group_id,
+                        cute.arch.block_idx()[0], TAGS["STORE_C"])
         self.epilogue(
             tiled_mma = tiled_mma,
             tCrC = tCrC, sC = sC,
@@ -267,3 +307,9 @@ class Matmul:
             with cute.arch.elect_one():
                 atomic_add_release((mAtomics.iterator + pipeline.next_idx).toint(), 1)
         cute.arch.mbarrier_arrive(output_bar_ot)
+        if cutlass.const_expr(self.profile) and warpgroup.group_tidx == 0:
+            range_stop(mProbe, warpgroup.group_id, TAGS["STORE_C"])
+            # Mark all matmul tags as valid in the header
+            range_finalize(mProbe, warpgroup.group_id,
+                           (1 << TAGS["LOAD_A"]) | (1 << TAGS["LOAD_B"]) |
+                           (1 << TAGS["COMPUTE_AB"]) | (1 << TAGS["STORE_C"]))

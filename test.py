@@ -12,6 +12,10 @@ parser = argparse.ArgumentParser()
 parser.add_argument("--num_iters", type = int, default = 100)
 parser.add_argument("--num_rounds", type = int, default = 100)
 parser.add_argument("--warmup", type = int, default = 10)
+parser.add_argument("--profile", action="store_true", default=False,
+                    help="Enable intrakernel profiler and dump JSON trace")
+parser.add_argument("--trace_path", type=str, default="pipeline_trace.json",
+                    help="Output path for the profiler JSON trace")
 
 args = parser.parse_args()
 
@@ -23,8 +27,8 @@ logger.setLevel(logging.DEBUG)
 input_config = InputConfig(
     bs = 8,
     embed_dim = 1024,
-    kv_len = 256, 
-    q_len = 256,
+    kv_len = 128, 
+    q_len = 128,
     num_q_heads = 8,
     num_kv_heads = 8,
     num_layers = 8,
@@ -86,6 +90,7 @@ with torch.no_grad():
 total_params = sum(p.numel() for p in model.parameters())
 print(f"Total Parameters : {total_params}", flush = True)
 
+# ---- Build the megakernel (non-profiled for correctness + benchmarks) ----
 start = time.time()
 megakernel = TransformerMegakernel(model, input_config = input_config, kernel_config = kernel_config)
 stop = time.time()
@@ -180,3 +185,42 @@ stop.record()
 torch.cuda.synchronize()
 time_taken = start.elapsed_time(stop)
 print(f"[eager]   {time_taken / args.num_iters:.3f}ms", flush = True)
+
+
+# ---- Intrakernel profiler pass ----
+# This runs a separate profiled megakernel after benchmarks are done so that
+# the profiler instrumentation doesn't affect benchmark timings.
+if args.profile:
+    print("\n" + "="*60, flush=True)
+    print("INTRAKERNEL PROFILER", flush=True)
+    print("="*60, flush=True)
+    print(f"Building profiled megakernel (profile=True)...", flush=True)
+
+    profiled_megakernel = TransformerMegakernel(
+        model, input_config=input_config, kernel_config=kernel_config,
+        profile=True
+    )
+
+    # Warmup the profiled kernel
+    for _ in range(3):
+        profiled_megakernel(input_embeddings.view(-1, input_config.embed_dim))
+    torch.cuda.synchronize()
+
+    # Run the profiled pass — dump_probe is called inside __call__ when profile=True
+    print(f"Running profiled pass, trace → {args.trace_path}", flush=True)
+    profiled_output = profiled_megakernel(
+        input_embeddings.view(-1, input_config.embed_dim),
+        trace_path=args.trace_path,
+    )
+    torch.cuda.synchronize()
+
+    # Verify the profiled kernel produces the same output
+    profiled_output_reshaped = profiled_output.view(
+        input_config.bs, input_config.q_len, -1
+    ).float()
+    profiled_diff = (profiled_output_reshaped - ref_bf16.float()).abs()
+    print(f"  Profiled max abs error vs bf16 ref: {profiled_diff.max().item():.6f}",
+          flush=True)
+    print(f"  Trace written to: {args.trace_path}", flush=True)
+    print("  Open with: chrome://tracing or https://ui.perfetto.dev", flush=True)
+    print("="*60, flush=True)
