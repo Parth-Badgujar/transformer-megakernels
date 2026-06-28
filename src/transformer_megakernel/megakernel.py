@@ -135,7 +135,8 @@ class Megakernel:
         mDown_proj:   cute.Tensor,
         mOutProjAttn: cute.Tensor,
         mEmbedding:   cute.Tensor,
-        mProbe: cute.Tensor
+        mProbe: cute.Tensor,
+        mStop_probe:  cute.Tensor
     ):
         q_layout  = cute.make_layout(
             shape  = (self.bs, self.num_q_heads,  self.q_len, self.head_dim),
@@ -268,7 +269,7 @@ class Megakernel:
 
         SharedStorage = self._get_shared_storage()
 
-        self.kernel(mProbe, mSchedule, mAtomics,
+        self.kernel(mProbe, mStop_probe, mSchedule, mAtomics,
                 g_RMS_inp, g_RMS_out, mRMS_weights,
                 g_QKV_inp, g_QKV_act, g_QKV_wt,
                 g_OUT_inp, g_OUT_out, g_OUT_wt, g_OUT_out_nt,
@@ -291,6 +292,7 @@ class Megakernel:
     @cute.kernel
     def kernel(self,
         mProbe: cute.Tensor,
+        mStop_probe: cute.Tensor,
         mSchedule: cute.Tensor,
         mAtomics: cute.Tensor,
         g_RMS_inp: cute.Tensor, g_RMS_out: cute.Tensor, mRMS_weights: cute.Tensor,
@@ -377,7 +379,8 @@ class Megakernel:
             input_phase = 0,
             output_phase = 0
         )
-
+        s_cnt = 0
+        st_cnt = 0
         max_works_local = (self.max_works + (1 - group_id)) // 2
 
         for local_work_idx in cutlass.range(max_works_local):
@@ -411,13 +414,13 @@ class Megakernel:
                     mProbe
                 )
             elif op_kind == int(Op.QKV):
-                self.qkv.run(
+                s_cnt, st_cnt = self.qkv.run(
                     g_QKV_inp, g_QKV_wt, g_QKV_act, None,
                     tma_QKV_inp, tma_QKV_wt, tma_QKV_act,
                     layer_idx, pid_m, pid_n,
                     mAtomics, pipeline, phases,
                     warpgroup, storage,
-                    mProbe
+                    mProbe, mStop_probe, s_cnt, st_cnt
                 )
             elif op_kind == int(Op.ATTN):
                 self.attn.run(
@@ -428,40 +431,40 @@ class Megakernel:
                     mProbe
                 )
             elif op_kind == int(Op.OUT):
-                self.out.run(
+                s_cnt, st_cnt = self.out.run(
                     g_OUT_inp, g_OUT_wt, g_OUT_out, g_OUT_out_nt,
                     tma_OUT_inp, tma_OUT_wt, tma_OUT_out,
                     layer_idx, pid_m, pid_n,
                     mAtomics, pipeline, phases,
                     warpgroup, storage,
-                    mProbe
+                    mProbe, mStop_probe, s_cnt, st_cnt
                 )
             elif op_kind == int(Op.UP):
-                self.up.run(
+                s_cnt, st_cnt = self.up.run(
                     g_UP_inp, g_UP_wt, g_UP_out, None,
                     tma_UP_inp, tma_UP_wt, tma_UP_out,
                     layer_idx, pid_m, pid_n,
                     mAtomics, pipeline, phases,
                     warpgroup, storage,
-                    mProbe
+                    mProbe, mStop_probe, s_cnt, st_cnt
                 )
             elif op_kind == int(Op.GATE):
-                self.gate.run(
+                s_cnt, st_cnt = self.gate.run(
                     g_GATE_inp, g_GATE_wt, g_GATE_out, g_GATE_gate,
                     tma_GATE_inp, tma_GATE_wt, tma_GATE_out,
                     layer_idx, pid_m, pid_n,
                     mAtomics, pipeline, phases,
                     warpgroup, storage,
-                    mProbe
+                    mProbe, mStop_probe, s_cnt, st_cnt
                 )
             elif op_kind == int(Op.DOWN):
-                self.down.run(
+                s_cnt, st_cnt = self.down.run(
                     g_DOWN_inp, g_DOWN_wt, g_DOWN_out, g_DOWN_out_nt,
                     tma_DOWN_inp, tma_DOWN_wt, tma_DOWN_out,
                     layer_idx, pid_m, pid_n,
                     mAtomics, pipeline, phases,
                     warpgroup, storage,
-                    mProbe
+                    mProbe, mStop_probe, s_cnt, st_cnt
                 )
 
             phases.compute_phase = phases.compute_phase ^ 1
@@ -507,11 +510,15 @@ class TransformerMegakernel:
 
         # 5. Allocate probe tensor (always, but only populated when profile=True)
         #    Shape: (num_sms * NUM_PROBE_ROLES, PROBE_COLS)  — int64 so timestamps fit
-        num_probe_rows = kernel_config.num_sms * NUM_PROBE_ROLES
+        num_probe_rows = 10000
         self.mProbe = torch.zeros(
-            (num_probe_rows, PROBE_COLS), dtype=torch.int64, device="cuda"
+            (num_probe_rows, self.num_sms, 2, 3), dtype=torch.int64, device="cuda"
+        )
+        self.mStop_probe = torch.zeros(
+            (num_probe_rows, self.num_sms, 2, 2), dtype=torch.int64, device="cuda"
         )
         self.cProbe = from_dlpack(self.mProbe, assumed_align = 16)
+        self.cStop_mProbe = from_dlpack(self.mStop_probe, assumed_align = 16)
 
         # 6. Compile the kernel
         self.kernel = Megakernel(input_config, kernel_config, profile=profile)
@@ -525,7 +532,7 @@ class TransformerMegakernel:
             self.cSchedule, self.cAtomics,
             self.cRms_w, self.cQkv_w, self.cWs1, self.cWs2,
             self.cGate_w, self.cUp_w, self.cDown_w, self.cOut_w,
-            cDummyEmb, self.cProbe
+            cDummyEmb, self.cProbe, self.cStop_mProbe
         )
 
     def __call__(self, input_embedding: torch.Tensor,
@@ -533,6 +540,7 @@ class TransformerMegakernel:
         self.mAtomics.zero_()
         if self.profile:
             self.mProbe.zero_()
+            self.mStop_probe.zero_()
         output_embedding = input_embedding.clone()
         cEmbedding = from_dlpack(output_embedding, assumed_align = 16)
 
@@ -540,11 +548,11 @@ class TransformerMegakernel:
             self.cSchedule, self.cAtomics,
             self.cRms_w, self.cQkv_w, self.cWs1, self.cWs2,
             self.cGate_w, self.cUp_w, self.cDown_w, self.cOut_w,
-            cEmbedding, self.cProbe
+            cEmbedding, self.cProbe, self.cStop_mProbe
         )
 
         if self.profile:
             torch.cuda.synchronize()
-            dump_probe(self.mProbe, self.num_sms, out_path=trace_path)
+            dump_probe(self.mProbe, self.mStop_probe, self.num_sms, max_events= 10000, out_path=trace_path)
 
         return output_embedding

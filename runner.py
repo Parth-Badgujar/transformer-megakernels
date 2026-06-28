@@ -21,12 +21,12 @@ def runner():
     if not os.path.exists(".venv"):
         subprocess.run(["uv", "venv", "--python", "3.12"])
     subprocess.run(["uv", "sync"])
-    # Run test.py with --profile to enable the intrakernel profiler and dump JSON trace
+    # Run test.py with profiling to verify profiler + JSON trace dump
     result = subprocess.run(
-        ["uv", "run", "test.py",
+        ["uv", "run", "python3", "-u", "test.py",
          "--num_iters", "1000",
-         "--num_rounds", "1000",
-        #  "--profile",
+         "--num_rounds", "100",
+         "--profile",
          "--trace_path", "pipeline_trace.json"],
     )
     vol.commit()

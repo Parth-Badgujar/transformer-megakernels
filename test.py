@@ -29,8 +29,8 @@ logger.setLevel(logging.DEBUG)
 input_config = InputConfig(
     bs = 8,
     embed_dim = 1024,
-    kv_len = 128, 
-    q_len = 128,
+    kv_len = 256, 
+    q_len = 256,
     num_q_heads = 8,
     num_kv_heads = 8,
     num_layers = 8,
@@ -42,7 +42,7 @@ kernel_config = KernelConfig(
     use_tma_reduce = True,
     output_pad = 8,
     warps_per_row = 1,
-    rows_per_rms_block = 32,
+    rows_per_rms_block = 16,
     max_works = 0,
     block_q = 64,
     block_kv = 64,
@@ -204,6 +204,8 @@ if args.profile:
     )
 
     # Warmup the profiled kernel
+    print(f"Warmup Profiler pass, trace → {args.trace_path}", flush=True)
+
     for _ in range(3):
         profiled_megakernel(input_embeddings.view(-1, input_config.embed_dim))
     torch.cuda.synchronize()

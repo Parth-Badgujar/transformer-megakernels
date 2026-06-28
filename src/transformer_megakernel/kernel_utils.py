@@ -5,6 +5,7 @@ from cutlass._mlir import ir
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import dsl_user_op, T
 from dataclasses import dataclass
+from collections import defaultdict
 
 @dataclass
 class WarpgroupMeta:
@@ -158,102 +159,139 @@ def smid_u32(*, loc=None, ip=None) -> cutlass.Int32:
 #   PROBE_HEADER + MAX_TAG_SLOTS * PROBE_ENTRY  (= 1 + 16*4 = 65 columns)
 # ---------------------------------------------------------------------------
 
-def range_start(probe, row, sm_val, tag_val):
+def range_start(start_probe, row, sm_val, tag_val, warpgroup):
     """Record the start of the range identified by *tag_val*.
 
     Multiple ranges with different tags can be open simultaneously.
     """
-    off = PROBE_HEADER + tag_val * PROBE_ENTRY
-    probe[row, off + 0] = cutlass.Int64(sm_val)
-    probe[row, off + 1] = cutlass.Int64(tag_val)
-    probe[row, off + 2] = globaltimer_u64()
+    start_probe[row, sm_val, warpgroup, 0] = cutlass.Int64(tag_val)
+    start_probe[row, sm_val, warpgroup, 1] = cutlass.Int64(warpgroup)
+    start_probe[row, sm_val, warpgroup, 2] = globaltimer_u64()
 
 
-def range_stop(probe, row, tag_val):
-    """Record the end of the range identified by *tag_val*.
+def range_stop(stop_probe, row, sm_val, tag_val, warpgroup):
+    stop_probe[row, sm_val, warpgroup, 0] = globaltimer_u64()
+    stop_probe[row, sm_val, warpgroup, 1] = cutlass.Int64(tag_val)
 
-    Stores only the end timestamp (no global memory load).
-    Duration is computed on the host side by dump_probe.
+
+def dump_probe(
+    start_probe: torch.Tensor,
+    stop_probe: torch.Tensor,
+    num_sms: int,
+    max_events,
+    out_path: str = "pipeline_trace.json",
+):
+    """Convert range_start/range_stop probe tensors into a Perfetto/Chrome
+    Trace Event Format JSON file.
+ 
+    Expected shapes:
+        start_probe: [max_events, num_sms, 2, 3]   # fields: tag, warpgroup, ts_ns
+        stop_probe:  [max_events, num_sms, 2, 3]    # fields: ts_ns, tag, (unused)
+ 
+    Mapping to Perfetto:
+        SM index        -> pid (process)
+        warpgroup index -> tid (thread)   (always 0 or 1)
+ 
+    Rows with tag_val == 0 are unused/empty slots and are skipped.
+ 
+    Start/stop events sharing the same (sm, warpgroup, tag) are paired in
+    row order: the 1st start for that tag pairs with the 1st stop for that
+    tag, the 2nd with the 2nd, etc. This is correct both for properly
+    nested (LIFO) ranges and for non-nested (FIFO) ranges of the same tag.
     """
-    off = PROBE_HEADER + tag_val * PROBE_ENTRY
-    probe[row, off + 3] = globaltimer_u64()
-
-
-def range_finalize(probe, row, tag_bitmask):
-    """Write a bitmask of which tag slots contain valid data.
-
-    Pass an integer whose bits correspond to tag values that were used, e.g.:
-        range_finalize(probe, row, (1 << TAGS['LOAD_K']) | (1 << TAGS['COMPUTE_QK']))
-    or simply pass ~0 / 0xFFFF to mark all 16 slots as potentially valid
-    (dump_probe will skip slots with a zero start timestamp).
-    """
-    probe[row, 0] = cutlass.Int64(tag_bitmask)
-
-
-def dump_probe(probe: torch.Tensor, num_blocks: int,
-               out_path: str = "pipeline_trace.json"):
-    """Decode probe data and emit a Perfetto/chrome-tracing JSON trace.
-
-    Each tag slot is valid when its start timestamp is non-zero and the
-    corresponding bit is set in the row header bitmask.  Pass tag_bitmask=~0
-    from range_finalize to include all tags that have a non-zero timestamp.
-    """
-    probe_cpu = probe.cpu().contiguous().tolist()
-    total_rows = num_blocks * NUM_PROBE_ROLES
-
-    for bid in range(min(num_blocks, 4)):
-        for role in range(NUM_PROBE_ROLES):
-            row_idx = bid * NUM_PROBE_ROLES + role
-            data = probe_cpu[row_idx]
-            tag_mask = int(data[0])
-            active_tags = [t for t in range(MAX_TAG_SLOTS) if tag_mask & (1 << t)]
-            print(f"\n--- Block {bid}, {ROLE_NAMES[role]} warp: "
-                  f"{len(active_tags)} active tag(s) ---")
-            for tag in active_tags:
-                off = PROBE_HEADER + tag * PROBE_ENTRY
-                sm_id = int(data[off])
-                start, end = int(data[off + 2]), int(data[off + 3])
-                dur = end - start if (start > 0 and end > 0) else 0
-                print(f"  sm={sm_id} {TAG_NAMES.get(tag, f'tag_{tag}'):20s} "
-                      f"start={start} dur={dur} ns")
-
-    events, global_base, sm_seen = [], None, set()
-    for row_idx in range(total_rows):
-        tag_mask = int(probe_cpu[row_idx][0])
-        for tag in range(MAX_TAG_SLOTS):
-            if not (tag_mask & (1 << tag)):
+    SENTINEL_TAG = 0
+    NUM_WARPGROUPS = 2
+ 
+    start_np = start_probe.detach().to("cpu").numpy()
+    stop_np = stop_probe.detach().to("cpu").numpy()
+ 
+    max_rows = min(max_events, start_np.shape[0], stop_np.shape[0])
+ 
+    starts = defaultdict(list)  # (sm, wg, tag) -> [(row, ts_ns), ...]
+    stops = defaultdict(list)   # (sm, wg, tag) -> [(row, ts_ns), ...]
+ 
+    for row in range(max_rows):
+        for sm in range(num_sms):
+            for wg in range(NUM_WARPGROUPS):
+                s_tag = int(start_np[row, sm, wg, 0])
+                if s_tag != SENTINEL_TAG:
+                    s_ts = int(start_np[row, sm, wg, 2])
+                    starts[(sm, wg, s_tag)].append((row, s_ts))
+ 
+                e_tag = int(stop_np[row, sm, wg, 1])
+                if e_tag != SENTINEL_TAG:
+                    e_ts = int(stop_np[row, sm, wg, 0])
+                    stops[(sm, wg, e_tag)].append((row, e_ts))
+ 
+    trace_events = []
+ 
+    all_keys = set(starts.keys()) | set(stops.keys())
+    for (sm, wg, tag) in all_keys:
+        s_list = sorted(starts.get((sm, wg, tag), []), key=lambda x: x[0])
+        e_list = sorted(stops.get((sm, wg, tag), []), key=lambda x: x[0])
+ 
+        n_pairs = min(len(s_list), len(e_list))
+        tag_name = TAG_NAMES.get(tag, f"tag_{tag}")
+ 
+        for i in range(n_pairs):
+            _, s_ts_ns = s_list[i]
+            _, e_ts_ns = e_list[i]
+ 
+            ts_us = s_ts_ns / 1000.0
+            dur_us = (e_ts_ns - s_ts_ns) / 1000.0
+ 
+            if dur_us < 0:
+                # Stale/garbage pairing — skip rather than emit a
+                # negative-duration event Perfetto can't render sensibly.
                 continue
-            s = int(probe_cpu[row_idx][PROBE_HEADER + tag * PROBE_ENTRY + 2])
-            if s > 0 and (global_base is None or s < global_base):
-                global_base = s
-    global_base = global_base or 0
-
-    for row_idx in range(total_rows):
-        data = probe_cpu[row_idx]
-        tag_mask = int(data[0])
-        if tag_mask == 0:
-            continue
-        role = row_idx % NUM_PROBE_ROLES
-        for tag in range(MAX_TAG_SLOTS):
-            if not (tag_mask & (1 << tag)):
-                continue
-            off = PROBE_HEADER + tag * PROBE_ENTRY
-            sm_id = int(data[off])
-            start, end = int(data[off + 2]), int(data[off + 3])
-            dur = end - start if (start > 0 and end > 0) else 0
-            if start == 0 and end == 0:
-                continue
-            if (sm_id, role) in sm_seen:
-                continue
-            events.append(dict(
-                name=TAG_NAMES.get(tag, f"tag_{tag}"), ph="X",
-                ts=(start - global_base) / 1000.0, dur=dur / 1000.0,
-                pid=sm_id, tid=role))
-        sm_seen.add((int(data[PROBE_HEADER]), role))
-
+ 
+            trace_events.append(
+                {
+                    "name": tag_name,
+                    "cat": "range",
+                    "ph": "X",  # complete event: start + duration in one entry
+                    "ts": ts_us,
+                    "dur": dur_us,
+                    "pid": sm,
+                    "tid": wg,
+                    "args": {
+                        "tag": tag,
+                        "tag_name": tag_name,
+                        "sm": sm,
+                        "warpgroup": wg,
+                    },
+                }
+            )
+ 
+    # Process/thread name metadata so Perfetto shows "SM N" / "Warpgroup N"
+    # instead of bare pid/tid numbers.
+    for sm in range(num_sms):
+        trace_events.append(
+            {
+                "name": "process_name",
+                "ph": "M",
+                "pid": sm,
+                "tid": 0,
+                "args": {"name": f"SM {sm}"},
+            }
+        )
+        for wg in range(NUM_WARPGROUPS):
+            trace_events.append(
+                {
+                    "name": "thread_name",
+                    "ph": "M",
+                    "pid": sm,
+                    "tid": wg,
+                    "args": {"name": f"Warpgroup {wg}"},
+                }
+            )
+ 
+    trace = {
+        "traceEvents": trace_events,
+        "displayTimeUnit": "ns",
+    }
+ 
     with open(out_path, "w") as f:
-        json.dump({"traceEvents": events}, f)
-    num_sms = len({e["pid"] for e in events})
-    print(f"\nTrace: {len(events)} events from {num_sms} SMs → {out_path}")
-    print("Open with chrome://tracing or https://ui.perfetto.dev")
-
+        json.dump(trace, f)
+ 
+    return out_path
