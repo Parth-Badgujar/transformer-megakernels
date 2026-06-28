@@ -149,7 +149,7 @@ def smid_u32(*, loc=None, ip=None) -> cutlass.Int32:
 #   col PROBE_HEADER + tag*4 + 0 : sm_id
 #   col PROBE_HEADER + tag*4 + 1 : tag value (redundant but keeps parity with old format)
 #   col PROBE_HEADER + tag*4 + 2 : start timestamp (ns)
-#   col PROBE_HEADER + tag*4 + 3 : duration (ns, written by range_stop)
+#   col PROBE_HEADER + tag*4 + 3 : end timestamp (ns, written by range_stop)
 #
 # Because the slot is keyed by tag, any number of ranges can be open at the
 # same time — range_stop identifies its matching range_start via tag_val.
@@ -172,10 +172,11 @@ def range_start(probe, row, sm_val, tag_val):
 def range_stop(probe, row, tag_val):
     """Record the end of the range identified by *tag_val*.
 
-    Can be called in any order relative to other range_stop calls.
+    Stores only the end timestamp (no global memory load).
+    Duration is computed on the host side by dump_probe.
     """
     off = PROBE_HEADER + tag_val * PROBE_ENTRY
-    probe[row, off + 3] = globaltimer_u64() - probe[row, off + 2]
+    probe[row, off + 3] = globaltimer_u64()
 
 
 def range_finalize(probe, row, tag_bitmask):
@@ -211,7 +212,8 @@ def dump_probe(probe: torch.Tensor, num_blocks: int,
             for tag in active_tags:
                 off = PROBE_HEADER + tag * PROBE_ENTRY
                 sm_id = int(data[off])
-                start, dur = int(data[off + 2]), int(data[off + 3])
+                start, end = int(data[off + 2]), int(data[off + 3])
+                dur = end - start if (start > 0 and end > 0) else 0
                 print(f"  sm={sm_id} {TAG_NAMES.get(tag, f'tag_{tag}'):20s} "
                       f"start={start} dur={dur} ns")
 
@@ -237,8 +239,9 @@ def dump_probe(probe: torch.Tensor, num_blocks: int,
                 continue
             off = PROBE_HEADER + tag * PROBE_ENTRY
             sm_id = int(data[off])
-            start, dur = int(data[off + 2]), int(data[off + 3])
-            if start == 0 and dur == 0:
+            start, end = int(data[off + 2]), int(data[off + 3])
+            dur = end - start if (start > 0 and end > 0) else 0
+            if start == 0 and end == 0:
                 continue
             if (sm_id, role) in sm_seen:
                 continue

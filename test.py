@@ -19,6 +19,8 @@ parser.add_argument("--trace_path", type=str, default="pipeline_trace.json",
 
 args = parser.parse_args()
 
+
+
 torch.manual_seed(42)
 
 logger = logging.getLogger(__name__)

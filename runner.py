@@ -14,7 +14,7 @@ image = (
 
 vol = modal.Volume.from_name("megakernel_volume", create_if_missing=True)
 
-@app.function(image=image, secrets=[modal.Secret.from_name("github_token")], volumes={"/data": vol}, gpu="RTX-PRO-6000", timeout=300)
+@app.function(image=image, volumes={"/data": vol}, gpu="RTX-PRO-6000", timeout=300)
 def runner():
     import subprocess
     import os
@@ -23,10 +23,10 @@ def runner():
     subprocess.run(["uv", "sync"])
     # Run test.py with --profile to enable the intrakernel profiler and dump JSON trace
     result = subprocess.run(
-        ["uv", "run", "python3", "-u", "test.py",
+        ["uv", "run", "test.py",
          "--num_iters", "1000",
          "--num_rounds", "1000",
-         "--profile",
+        #  "--profile",
          "--trace_path", "pipeline_trace.json"],
     )
     vol.commit()
