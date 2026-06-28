@@ -228,7 +228,9 @@ class Attention:
         phases: Phases,
         warpgroup: WarpgroupMeta,
         storage,
-        mProbe
+        mStart_probe: cute.Tensor,
+        mStop_probe: cute.Tensor,
+        s_cnt, st_cnt
     ):
         LOG2_E = math.log2(math.e)
         cfg = self.config
@@ -356,19 +358,23 @@ class Attention:
 
         # ---- prefetch K_0, Q_0 into stage c ----
         # Load Q and K_0 concurrently (both cp_async, overlap is real)
-        # if cutlass.const_expr(self.profile):
-        #     if warpgroup.group_tidx == 0:
-        #         range_start(mProbe, warpgroup.group_id,
-        #                     cute.arch.block_idx()[0], TAGS["LOAD_QK"])
-        #         range_start(mProbe, warpgroup.group_id,
-        #                     cute.arch.block_idx()[0], TAGS["LOAD_K"])
+        if cutlass.const_expr(self.profile):
+            if warpgroup.group_tidx == 0:
+                range_start(mStart_probe, s_cnt, cute.arch.block_idx()[0], TAGS["LOAD_QK"], warpgroup.group_id)
+                s_cnt += 1
+                range_start(mStart_probe, s_cnt, cute.arch.block_idx()[0], TAGS["LOAD_K"], warpgroup.group_id)
+                s_cnt += 1
+                
         load_Q()
         load_K(0)
         # Q is shared across every KV block -> stage it smem -> rmem exactly once.
         cute.arch.cp_async_wait_group(1)   # K_0 still in flight while Q has landed
-        # if cutlass.const_expr(self.profile):
-        #     if warpgroup.group_tidx == 0:
-        #         range_stop(mProbe, warpgroup.group_id, TAGS["LOAD_QK"])
+
+        if cutlass.const_expr(self.profile):
+            if warpgroup.group_tidx == 0:
+                range_stop(mStop_probe, st_cnt, cute.arch.block_idx()[0], TAGS["LOAD_QK"], warpgroup.group_id)
+                st_cnt += 1
+
         warpgroup_sync()
         cute.copy(thr_cpy_Q_V, thr_cpy_Q_V.partition_S(sQ), thr_cpy_Q_V.retile(rmem_tensor_Q_S))
 
@@ -401,79 +407,111 @@ class Attention:
         for n in cutlass.range(last):
             acc_S.fill(0.0)
             # K_n is already in smem; start loading V_n while QK compute runs
-            # if cutlass.const_expr(self.profile):
-            #     if warpgroup.group_tidx == 0:
-            #         range_start(mProbe, warpgroup.group_id,
-            #                     cute.arch.block_idx()[0], TAGS["LOAD_V"])
+            if cutlass.const_expr(self.profile):
+                if warpgroup.group_tidx == 0:
+                    range_start(mStart_probe, s_cnt, cute.arch.block_idx()[0], TAGS["LOAD_V"], warpgroup.group_id)
+                    s_cnt += 1
+                
             load_V(n)
+
             cute.arch.cp_async_wait_group(1)       # K_n has landed; V_n still in flight
             # Close K load range (opened at end of previous iter, or prologue for n==0)
-            # if cutlass.const_expr(self.profile):
-            #     if warpgroup.group_tidx == 0:
-            #         range_stop(mProbe, warpgroup.group_id, TAGS["LOAD_K"])
-            #         range_start(mProbe, warpgroup.group_id,
-            #                     cute.arch.block_idx()[0], TAGS["COMPUTE_QK"])
+
+            if cutlass.const_expr(self.profile):
+                if warpgroup.group_tidx == 0:
+                    range_stop(mStop_probe, st_cnt, cute.arch.block_idx()[0], TAGS["LOAD_K"], warpgroup.group_id)
+                    st_cnt += 1
+                    range_start(mStart_probe, s_cnt, cute.arch.block_idx()[0], TAGS["COMPUTE_QK"], warpgroup.group_id)
+                    s_cnt += 1
             gemm_QK()
+
             # Prefetch next K while PV is computed
-            # if cutlass.const_expr(self.profile):
-            #     if warpgroup.group_tidx == 0:
-            #         range_stop(mProbe, warpgroup.group_id, TAGS["COMPUTE_QK"])
-            #         range_start(mProbe, warpgroup.group_id,
-            #                     cute.arch.block_idx()[0], TAGS["LOAD_K"])
-            load_K(n + 1)                           # prefetch next K
-            # if cutlass.const_expr(self.profile):
-            #     if warpgroup.group_tidx == 0:
-            #         range_start(mProbe, warpgroup.group_id,
-            #                     cute.arch.block_idx()[0], TAGS["ROW_REDUCE_SOFTMAX"])
+
+            if cutlass.const_expr(self.profile):
+                if warpgroup.group_tidx == 0:
+                    range_stop(mStop_probe, st_cnt, cute.arch.block_idx()[0], TAGS["COMPUTE_QK"], warpgroup.group_id)
+                    st_cnt += 1
+                    range_start(mStart_probe, s_cnt, cute.arch.block_idx()[0], TAGS["LOAD_K"], warpgroup.group_id)
+                    s_cnt += 1
+
+            load_K(n + 1)      # prefetch next K
+            
+            if cutlass.const_expr(self.profile):
+                if warpgroup.group_tidx == 0:
+                    range_start(mStart_probe, s_cnt, cute.arch.block_idx()[0], TAGS["ROW_REDUCE_SOFTMAX"], warpgroup.group_id)
+                    s_cnt += 1
+
             row_reduce_softmax()
-            # if cutlass.const_expr(self.profile):
-            #     if warpgroup.group_tidx == 0:
-            #         range_stop(mProbe, warpgroup.group_id, TAGS["ROW_REDUCE_SOFTMAX"])
+
+            if cutlass.const_expr(self.profile):
+                if warpgroup.group_tidx == 0:
+                    range_stop(mStop_probe, st_cnt, cute.arch.block_idx()[0], TAGS["ROW_REDUCE_SOFTMAX"], warpgroup.group_id)
+                    st_cnt += 1
+
             cute.arch.cp_async_wait_group(1)        # V_n has landed
-            # if cutlass.const_expr(self.profile):
-            #     if warpgroup.group_tidx == 0:
-            #         range_stop(mProbe, warpgroup.group_id, TAGS["LOAD_V"])
-            #         range_start(mProbe, warpgroup.group_id,
+
+            if cutlass.const_expr(self.profile):
+                if warpgroup.group_tidx == 0:
+                    range_stop(mStop_probe, st_cnt, cute.arch.block_idx()[0], TAGS["LOAD_V"], warpgroup.group_id)
+                    st_cnt += 1
+                    range_start(mStart_probe, s_cnt, cute.arch.block_idx()[0], TAGS["COMPUTE_PV"], warpgroup.group_id)
+                    s_cnt += 1
             #                     cute.arch.block_idx()[0], TAGS["COMPUTE_PV"])
             gemm_PV()
-            # if cutlass.const_expr(self.profile):
-            #     if warpgroup.group_tidx == 0:
-            #         range_stop(mProbe, warpgroup.group_id, TAGS["COMPUTE_PV"])
+            if cutlass.const_expr(self.profile):
+                if warpgroup.group_tidx == 0:
+                    range_stop(mStop_probe, st_cnt, cute.arch.block_idx()[0], TAGS["COMPUTE_PV"], warpgroup.group_id)
+                    st_cnt += 1
 
         # ---- tail: last KV block signals the input barrier instead of prefetching ----
+        if cutlass.const_expr(self.profile):
+            if warpgroup.group_tidx == 0:
+                range_start(mStart_probe, s_cnt, cute.arch.block_idx()[0], TAGS["LOAD_V"], warpgroup.group_id)
+                s_cnt += 1
+            
         acc_S.fill(0.0)
-        # if cutlass.const_expr(self.profile):
-        #     if warpgroup.group_tidx == 0:
-        #         range_start(mProbe, warpgroup.group_id,
-        #                     cute.arch.block_idx()[0], TAGS["LOAD_V"])
         load_V(last)
         cute.arch.cp_async_wait_group(1)
-        # if cutlass.const_expr(self.profile):
-        #     if warpgroup.group_tidx == 0:
-        #         range_stop(mProbe, warpgroup.group_id, TAGS["LOAD_K"])
-        #         range_start(mProbe, warpgroup.group_id,
-        #                     cute.arch.block_idx()[0], TAGS["COMPUTE_QK"])
+
+        if cutlass.const_expr(self.profile):
+            if warpgroup.group_tidx == 0:
+                range_stop(mStop_probe, st_cnt, cute.arch.block_idx()[0], TAGS["LOAD_K"], warpgroup.group_id)
+                st_cnt += 1
+                range_start(mStart_probe, s_cnt, cute.arch.block_idx()[0], TAGS["COMPUTE_QK"], warpgroup.group_id)
+                s_cnt += 1
+
         gemm_QK()
         cute.arch.mbarrier_arrive(self.input_bar_ot)
-        # if cutlass.const_expr(self.profile):
-        #     if warpgroup.group_tidx == 0:
-        #         range_stop(mProbe, warpgroup.group_id, TAGS["COMPUTE_QK"])
-        #         range_start(mProbe, warpgroup.group_id,
-        #                     cute.arch.block_idx()[0], TAGS["ROW_REDUCE_SOFTMAX"])
+
+        if cutlass.const_expr(self.profile):
+            if warpgroup.group_tidx == 0:
+                range_stop(mStop_probe, st_cnt, cute.arch.block_idx()[0], TAGS["COMPUTE_QK"], warpgroup.group_id)
+                st_cnt += 1
+                range_start(mStart_probe, s_cnt, cute.arch.block_idx()[0], TAGS["ROW_REDUCE_SOFTMAX"], warpgroup.group_id)
+                s_cnt += 1
+
         row_reduce_softmax(is_causal=cfg.is_causal)
-        # if cutlass.const_expr(self.profile):
-        #     if warpgroup.group_tidx == 0:
-        #         range_stop(mProbe, warpgroup.group_id, TAGS["ROW_REDUCE_SOFTMAX"])
+
+        if cutlass.const_expr(self.profile):
+            if warpgroup.group_tidx == 0:
+                range_stop(mStop_probe, st_cnt, cute.arch.block_idx()[0], TAGS["ROW_REDUCE_SOFTMAX"], warpgroup.group_id)
+                st_cnt += 1
+
         cute.arch.cp_async_wait_group(0)
-        # if cutlass.const_expr(self.profile):
-        #     if warpgroup.group_tidx == 0:
-        #         range_stop(mProbe, warpgroup.group_id, TAGS["LOAD_V"])
-        #         range_start(mProbe, warpgroup.group_id,
-        #                     cute.arch.block_idx()[0], TAGS["COMPUTE_PV"])
+
+        if cutlass.const_expr(self.profile):
+            if warpgroup.group_tidx == 0:
+                range_stop(mStop_probe, st_cnt, cute.arch.block_idx()[0], TAGS["LOAD_V"], warpgroup.group_id)
+                st_cnt += 1
+                range_start(mStart_probe, s_cnt, cute.arch.block_idx()[0], TAGS["COMPUTE_PV"], warpgroup.group_id)
+                s_cnt += 1
+
         gemm_PV()
-        # if cutlass.const_expr(self.profile):
-        #     if warpgroup.group_tidx == 0:
-        #         range_stop(mProbe, warpgroup.group_id, TAGS["COMPUTE_PV"])
+
+        if cutlass.const_expr(self.profile):
+            if warpgroup.group_tidx == 0:
+                range_stop(mStop_probe, st_cnt, cute.arch.block_idx()[0], TAGS["COMPUTE_PV"], warpgroup.group_id)
+                st_cnt += 1
 
         # ---- finalize ----
         cute.arch.mbarrier_arrive(self.compute_bar_ot)
@@ -493,9 +531,12 @@ class Attention:
         warpgroup_sync()
 
         if warpgroup.warp_id == 0:
-            # if cutlass.const_expr(self.profile) and warpgroup.group_tidx == 0:
-            #     range_start(mProbe, warpgroup.group_id,
-            #                 cute.arch.block_idx()[0], TAGS["ATTENTION_STORE"])
+
+            if cutlass.const_expr(self.profile):
+                if warpgroup.group_tidx == 0:
+                    range_start(mStart_probe, s_cnt, cute.arch.block_idx()[0], TAGS["ATTENTION_STORE"], warpgroup.group_id)
+                    s_cnt += 1
+            
             gO_tma = cute.local_tile(gOut, (1, 1, cfg.bQ,  cfg.head_dim + cfg.output_pad), (batch_idx, q_head_idx, query_block_idx, 0))
             sO_g = cute.group_modes(sO_tma, 0, cute.rank(sO_tma.layout))
             gO_g = cute.group_modes(gO_tma, 0, cute.rank(gO_tma.layout))
@@ -508,12 +549,9 @@ class Attention:
             with cute.arch.elect_one():
                 atomic_add_release((mAtomics.iterator + pipeline.next_idx).toint(), 1)
         cute.arch.mbarrier_arrive(self.output_bar_ot)
-        # if cutlass.const_expr(self.profile):
-        #     if warpgroup.group_tidx == 0:
-        #         range_stop(mProbe, warpgroup.group_id, TAGS["ATTENTION_STORE"])
-                # Mark all attention tags active in the header bitmask
-                # range_finalize(mProbe, warpgroup.group_id,
-                #             (1 << TAGS["LOAD_QK"]) | (1 << TAGS["LOAD_K"]) |
-                #             (1 << TAGS["LOAD_V"]) | (1 << TAGS["COMPUTE_QK"]) |
-                #             (1 << TAGS["ROW_REDUCE_SOFTMAX"]) | (1 << TAGS["COMPUTE_PV"]) |
-                #             (1 << TAGS["ATTENTION_STORE"]))
+
+        if cutlass.const_expr(self.profile):
+            if warpgroup.group_tidx == 0:
+                range_stop(mStop_probe, st_cnt, cute.arch.block_idx()[0], TAGS["ATTENTION_STORE"], warpgroup.group_id)
+                st_cnt += 1
+        return s_cnt, st_cnt

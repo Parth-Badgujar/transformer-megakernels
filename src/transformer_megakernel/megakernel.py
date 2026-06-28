@@ -423,12 +423,12 @@ class Megakernel:
                     mProbe, mStop_probe, s_cnt, st_cnt
                 )
             elif op_kind == int(Op.ATTN):
-                self.attn.run(
+                s_cnt, st_cnt = self.attn.run(
                     mQ, mK, mV, g_ATTN_out, tma_ATTN_out,
                     pid_m, pid_n, pid_o,
                     mAtomics, pipeline, phases,
                     warpgroup, storage,
-                    mProbe
+                    mProbe, mStop_probe, s_cnt, st_cnt
                 )
             elif op_kind == int(Op.OUT):
                 s_cnt, st_cnt = self.out.run(
