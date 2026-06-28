@@ -405,13 +405,13 @@ class Megakernel:
 
             if op_kind == int(Op.RMS):
                 rms_w_idx = layer_idx * 2 + pid_o
-                self.rmsnorm.run(
+                s_cnt, st_cnt = self.rmsnorm.run(
                     g_RMS_inp, g_RMS_out, mRMS_weights,
                     tma_RMS_inp, tma_RMS_out,
                     rms_w_idx, pid_m, 
                     mAtomics, pipeline, phases,
                     warpgroup, storage,
-                    mProbe
+                    mProbe, mStop_probe, s_cnt, st_cnt
                 )
             elif op_kind == int(Op.QKV):
                 s_cnt, st_cnt = self.qkv.run(

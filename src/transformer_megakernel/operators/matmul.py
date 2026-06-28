@@ -226,7 +226,7 @@ class Matmul:
                 while ready != pipeline.expected_cnt:
                     ready = ld_acquire_u32((mAtomics.iterator + pipeline.current_idx).toint())
             cute.arch.sync_warp()
-        
+
         if cutlass.const_expr(self.profile):
             if warpgroup.group_tidx == 0:
                 range_start(mStart_probe, s_cnt, cute.arch.block_idx()[0], TAGS["LOAD_A"], warpgroup.group_id)
@@ -290,6 +290,7 @@ class Matmul:
             if warpgroup.group_tidx == 0:
                 range_start(mStart_probe, s_cnt, cute.arch.block_idx()[0], TAGS["COMPUTE_AB"], warpgroup.group_id)
                 s_cnt += 1
+
         gemm(stage)
 
         if cutlass.const_expr(self.profile):

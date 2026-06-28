@@ -138,7 +138,9 @@ class RMSNorm:
         phases: Phases,
         warpgroup: WarpgroupMeta,
         storage,
-        mProbe: cute.Tensor
+        mStart_probe: cute.Tensor,
+        mStop_probe: cute.Tensor,
+        s_cnt, st_cnt
     ):
         cfg = self.config
         num_stages = 2 ## Hardcoded to 2 as of now
@@ -189,10 +191,10 @@ class RMSNorm:
             cute.nvgpu.CopyUniversalOp(), BFloat16, num_bits_per_copy=128
         )
 
-        # if cutlass.const_expr(self.profile):
-        #     if warpgroup.group_tidx == 0:
-        #         range_start(mProbe, warpgroup.group_id,
-        #                     cute.arch.block_idx()[0], TAGS["LOAD_WEIGHTS"])
+        if cutlass.const_expr(self.profile):
+            if warpgroup.group_tidx == 0:
+                range_start(mStart_probe, s_cnt, cute.arch.block_idx()[0], TAGS["LOAD_WEIGHTS"], warpgroup.group_id)
+                s_cnt += 1
 
         tv_layout = self._make_tv_layout()
         thr = cute.make_tiled_copy(atom, tv_layout, (num_sets, cfg.embed_dim)).get_slice(group_tid)
@@ -207,9 +209,10 @@ class RMSNorm:
         cute.autovec_copy(tWsW, rW)
         wv = rW.load().to(Float32)
 
-        # if cutlass.const_expr(self.profile):
-        #     if warpgroup.group_tidx == 0:
-        #         range_stop(mProbe, warpgroup.group_id, TAGS["LOAD_WEIGHTS"])
+        if cutlass.const_expr(self.profile):
+            if warpgroup.group_tidx == 0:
+                range_stop(mStop_probe, st_cnt, cute.arch.block_idx()[0], TAGS["LOAD_WEIGHTS"], warpgroup.group_id)
+                st_cnt += 1
 
         # Bind helpers via partial
         load_activations = partial(
@@ -255,10 +258,10 @@ class RMSNorm:
 
         # ---- prologue: prefetch the first (num_stages-1) chunks ----
         prev_stage = stage
-        # if cutlass.const_expr(self.profile):
-        #     if warpgroup.group_tidx == 0:
-        #         range_start(mProbe, warpgroup.group_id,
-        #                     cute.arch.block_idx()[0], TAGS["LOAD_ROW"])
+        if cutlass.const_expr(self.profile):
+            if warpgroup.group_tidx == 0:
+                range_start(mStart_probe, s_cnt, cute.arch.block_idx()[0], TAGS["LOAD_ROW"], warpgroup.group_id)
+                s_cnt += 1
         for s in cutlass.range_constexpr(num_stages - 1):
             load_activations(stage, s)
             stage = (stage + 1) % num_stages
@@ -269,28 +272,31 @@ class RMSNorm:
         for it in cutlass.range_constexpr(0, chunks - 1):
             load_activations(stage, it + (num_stages - 1))
             load_phase = wait_stage(prev_stage, load_phase)
-            # if cutlass.const_expr(self.profile):
-            #     if warpgroup.group_tidx == 0:
-            #         # Activation tile ready; close load range and open compute range
-            #         range_stop(mProbe, warpgroup.group_id, TAGS["LOAD_ROW"])
-            #         range_start(mProbe, warpgroup.group_id,
-            #                     cute.arch.block_idx()[0], TAGS["COMPUTE_ROW"])
+            if cutlass.const_expr(self.profile):
+                if warpgroup.group_tidx == 0:
+                    # Activation tile ready; close load range and open compute range
+                    range_stop(mStop_probe, st_cnt, cute.arch.block_idx()[0], TAGS["LOAD_ROW"], warpgroup.group_id)
+                    st_cnt += 1
+                    range_start(mStart_probe, s_cnt, cute.arch.block_idx()[0], TAGS["COMPUTE_ROW"], warpgroup.group_id)
+                    s_cnt += 1
             rX = load_regs(prev_stage)
             if it == 0:
                 cute.arch.mbarrier_wait(output_bar_me, phases.output_phase)
             compute(prev_stage, rX)
-            # if cutlass.const_expr(self.profile):
-            #     if warpgroup.group_tidx == 0:
-            #         range_stop(mProbe, warpgroup.group_id, TAGS["COMPUTE_ROW"])
-            #         range_start(mProbe, warpgroup.group_id,
-            #                     cute.arch.block_idx()[0], TAGS["STORE_ROW"])
+            if cutlass.const_expr(self.profile):
+                if warpgroup.group_tidx == 0:
+                    range_stop(mStop_probe, st_cnt, cute.arch.block_idx()[0], TAGS["COMPUTE_ROW"], warpgroup.group_id)
+                    st_cnt += 1
+                    range_start(mStart_probe, s_cnt, cute.arch.block_idx()[0], TAGS["STORE_ROW"], warpgroup.group_id)
+                    s_cnt += 1
             store_outputs(prev_stage, it)
-            # if cutlass.const_expr(self.profile):
-            #     if warpgroup.group_tidx == 0:
-            #         range_stop(mProbe, warpgroup.group_id, TAGS["STORE_ROW"])
-            #         # Overlap: start loading next activation tile while store is in flight
-            #         range_start(mProbe, warpgroup.group_id,
-            #                     cute.arch.block_idx()[0], TAGS["LOAD_ROW"])
+            if cutlass.const_expr(self.profile):
+                if warpgroup.group_tidx == 0:
+                    range_stop(mStop_probe, st_cnt, cute.arch.block_idx()[0], TAGS["STORE_ROW"], warpgroup.group_id)
+                    st_cnt += 1
+                    # Overlap: start loading next activation tile while store is in flight
+                    range_start(mStart_probe, s_cnt, cute.arch.block_idx()[0], TAGS["LOAD_ROW"], warpgroup.group_id)
+                    s_cnt += 1
             stage      = (stage + 1) % num_stages
             prev_stage = (prev_stage + 1) % num_stages
 
@@ -304,18 +310,20 @@ class RMSNorm:
         load_phase = wait_stage(prev_stage, load_phase)
         rX = load_regs(prev_stage)
         cute.arch.mbarrier_arrive(compute_bar_ot)
-        # if cutlass.const_expr(self.profile):
-        #     if warpgroup.group_tidx == 0:
-        #         # Close last LOAD_ROW and start tail COMPUTE_ROW
-        #         range_stop(mProbe, warpgroup.group_id, TAGS["LOAD_ROW"])
-        #         range_start(mProbe, warpgroup.group_id,
-        #                     cute.arch.block_idx()[0], TAGS["COMPUTE_ROW"])
+        if cutlass.const_expr(self.profile):
+            if warpgroup.group_tidx == 0:
+                # Close last LOAD_ROW and start tail COMPUTE_ROW
+                range_stop(mStop_probe, st_cnt, cute.arch.block_idx()[0], TAGS["LOAD_ROW"], warpgroup.group_id)
+                st_cnt += 1
+                range_start(mStart_probe, s_cnt, cute.arch.block_idx()[0], TAGS["COMPUTE_ROW"], warpgroup.group_id)
+                s_cnt += 1
         compute(prev_stage, rX)
-        # if cutlass.const_expr(self.profile):
-        #     if warpgroup.group_tidx == 0:
-        #         range_stop(mProbe, warpgroup.group_id, TAGS["COMPUTE_ROW"])
-        #         range_start(mProbe, warpgroup.group_id,
-        #                     cute.arch.block_idx()[0], TAGS["STORE_ROW"])
+        if cutlass.const_expr(self.profile):
+            if warpgroup.group_tidx == 0:
+                range_stop(mStop_probe, st_cnt, cute.arch.block_idx()[0], TAGS["COMPUTE_ROW"], warpgroup.group_id)
+                st_cnt += 1
+                range_start(mStart_probe, s_cnt, cute.arch.block_idx()[0], TAGS["STORE_ROW"], warpgroup.group_id)
+                s_cnt += 1
         store_outputs(prev_stage, chunks - 1)
         if warp_id == 0:
             cute.arch.cp_async_bulk_wait_group(0)
@@ -324,10 +332,9 @@ class RMSNorm:
             with cute.arch.elect_one():
                 atomic_add_release((mAtomics.iterator + pipeline.next_idx).toint(), cutlass.Int32(1))
         cute.arch.mbarrier_arrive(output_bar_ot)
-        # if cutlass.const_expr(self.profile):
-        #     if warpgroup.group_tidx == 0:
-                # range_stop(mProbe, warpgroup.group_id, TAGS["STORE_ROW"])
-                # Mark all RMSNorm tags active in the header bitmask
-                # range_finalize(mProbe, warpgroup.group_id,
-                #             (1 << TAGS["LOAD_WEIGHTS"]) | (1 << TAGS["LOAD_ROW"]) |
-                #             (1 << TAGS["COMPUTE_ROW"]) | (1 << TAGS["STORE_ROW"]))
+        if cutlass.const_expr(self.profile):
+            if warpgroup.group_tidx == 0:
+                range_stop(mStop_probe, st_cnt, cute.arch.block_idx()[0], TAGS["STORE_ROW"], warpgroup.group_id)
+                st_cnt += 1
+                
+        return s_cnt, st_cnt
