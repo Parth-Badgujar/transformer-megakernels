@@ -360,7 +360,7 @@ class Attention:
         # Load Q and K_0 concurrently (both cp_async, overlap is real)
         if cutlass.const_expr(self.profile):
             if warpgroup.group_tidx == 0:
-                range_start(mStart_probe, s_cnt, cute.arch.block_idx()[0], TAGS["LOAD_QK"], warpgroup.group_id)
+                range_start(mStart_probe, s_cnt, cute.arch.block_idx()[0], TAGS["LOAD_Q"], warpgroup.group_id)
                 s_cnt += 1
                 range_start(mStart_probe, s_cnt, cute.arch.block_idx()[0], TAGS["LOAD_K"], warpgroup.group_id)
                 s_cnt += 1
@@ -372,7 +372,7 @@ class Attention:
 
         if cutlass.const_expr(self.profile):
             if warpgroup.group_tidx == 0:
-                range_stop(mStop_probe, st_cnt, cute.arch.block_idx()[0], TAGS["LOAD_QK"], warpgroup.group_id)
+                range_stop(mStop_probe, st_cnt, cute.arch.block_idx()[0], TAGS["LOAD_Q"], warpgroup.group_id)
                 st_cnt += 1
 
         warpgroup_sync()
@@ -520,6 +520,10 @@ class Attention:
         # ---- write O into the output section, AFTER the output barrier ----
         rO_bf = cute.make_fragment_like(acc_O, BFloat16)
         cute.arch.mbarrier_wait(self.output_bar_me, phases.output_phase)
+        if cutlass.const_expr(self.profile):
+            if warpgroup.group_tidx == 0:
+                range_start(mStart_probe, s_cnt, cute.arch.block_idx()[0], TAGS["ATTENTION_STORE"], warpgroup.group_id)
+                s_cnt += 1
         rO_bf.store(acc_O.load().to(BFloat16))
 
         smem_store_bf  = cute.make_copy_atom(warp.StMatrix8x8x16bOp(num_matrices=4), BFloat16)
@@ -531,12 +535,6 @@ class Attention:
         warpgroup_sync()
 
         if warpgroup.warp_id == 0:
-
-            if cutlass.const_expr(self.profile):
-                if warpgroup.group_tidx == 0:
-                    range_start(mStart_probe, s_cnt, cute.arch.block_idx()[0], TAGS["ATTENTION_STORE"], warpgroup.group_id)
-                    s_cnt += 1
-            
             gO_tma = cute.local_tile(gOut, (1, 1, cfg.bQ,  cfg.head_dim + cfg.output_pad), (batch_idx, q_head_idx, query_block_idx, 0))
             sO_g = cute.group_modes(sO_tma, 0, cute.rank(sO_tma.layout))
             gO_g = cute.group_modes(gO_tma, 0, cute.rank(gO_tma.layout))

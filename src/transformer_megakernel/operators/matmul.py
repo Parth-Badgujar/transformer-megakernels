@@ -220,6 +220,7 @@ class Matmul:
         # ---- prologue: prefetch a SINGLE stage ----
         expect_tx(stage)
         load_B(stage, 0)
+
         if warpgroup.warp_id == 0:
             with cute.arch.elect_one():
                 ready = 0
@@ -236,16 +237,10 @@ class Matmul:
         prefetch_stage = (stage + 1) % cfg.num_stages
         cute.arch.mbarrier_wait(compute_bar_me, phases.compute_phase)
 
-        if cutlass.const_expr(self.profile):
-            if warpgroup.group_tidx == 0:
-                range_stop(mStop_probe, st_cnt, cute.arch.block_idx()[0], TAGS["LOAD_A"], warpgroup.group_id)
-                st_cnt += 1
-                range_stop(mStop_probe, st_cnt, cute.arch.block_idx()[0], TAGS["LOAD_B"], warpgroup.group_id)
-                st_cnt += 1
-
         # ---- mainloop: k_tiles-1 iterations, each prefetches the next tile ----
         for k_tile in cutlass.range(0, k_tiles - 1):
             expect_tx(prefetch_stage)
+
             if cutlass.const_expr(self.profile):
                 if warpgroup.group_tidx == 0:
                     range_start(mStart_probe, s_cnt, cute.arch.block_idx()[0], TAGS["LOAD_A"], warpgroup.group_id)
@@ -288,6 +283,10 @@ class Matmul:
 
         if cutlass.const_expr(self.profile):
             if warpgroup.group_tidx == 0:
+                range_stop(mStop_probe, st_cnt, cute.arch.block_idx()[0], TAGS["LOAD_A"], warpgroup.group_id)
+                st_cnt += 1
+                range_stop(mStop_probe, st_cnt, cute.arch.block_idx()[0], TAGS["LOAD_B"], warpgroup.group_id)
+                st_cnt += 1
                 range_start(mStart_probe, s_cnt, cute.arch.block_idx()[0], TAGS["COMPUTE_AB"], warpgroup.group_id)
                 s_cnt += 1
 
@@ -335,4 +334,5 @@ class Matmul:
             if warpgroup.group_tidx == 0:
                 range_stop(mStop_probe, st_cnt, cute.arch.block_idx()[0], TAGS["STORE_C"], warpgroup.group_id)
                 st_cnt += 1
+                
         return s_cnt, st_cnt

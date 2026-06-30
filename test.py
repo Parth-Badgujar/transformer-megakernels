@@ -19,7 +19,8 @@ parser.add_argument("--trace_path", type=str, default="pipeline_trace.json",
 
 args = parser.parse_args()
 
-
+num_sms = torch.cuda.get_device_properties(0).multi_processor_count
+print(f"Total SMS: {num_sms}", flush = True)
 
 torch.manual_seed(42)
 
@@ -50,7 +51,7 @@ kernel_config = KernelConfig(
     bM = 128,
     bN = 128,
     bK = 64,
-    num_sms = 188
+    num_sms = num_sms
 )
 
 model = Transformer(

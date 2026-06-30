@@ -21,7 +21,7 @@ from transformer_megakernel.kernel_utils import (
     WarpgroupMeta, Phases, PipelineMeta,
     PROBE_HEADER, PROBE_ENTRY, MAX_TAG_SLOTS, NUM_PROBE_ROLES,
     ROLE_NAMES, TAG_NAMES, TAGS,
-    dump_probe,
+    dump_probe, debug_pairs
 )
 
 from cutlass import Int32, BFloat16, Uint64
@@ -477,7 +477,6 @@ class TransformerMegakernel:
                  kernel_config: KernelConfig, profile: bool = False):
         self.profile    = profile
         self.num_sms    = kernel_config.num_sms
-
         # 1. Extract weights from model
         rms_w, qkv_w, out_w, gate_w, up_w, down_w = extract_weights(model)
         # 2. Build schedule
@@ -510,7 +509,7 @@ class TransformerMegakernel:
 
         # 5. Allocate probe tensor (always, but only populated when profile=True)
         #    Shape: (num_sms * NUM_PROBE_ROLES, PROBE_COLS)  — int64 so timestamps fit
-        num_probe_rows = 10000
+        num_probe_rows = 30000
         self.mProbe = torch.zeros(
             (num_probe_rows, self.num_sms, 2, 3), dtype=torch.int64, device="cuda"
         )
@@ -553,6 +552,9 @@ class TransformerMegakernel:
 
         if self.profile:
             torch.cuda.synchronize()
-            dump_probe(self.mProbe, self.mStop_probe, self.num_sms, max_events= 10000, out_path=trace_path)
+            dump_probe(self.mProbe, self.mStop_probe, self.num_sms, max_events= 30000, out_path=trace_path)
+            # debug_pairs(start_probe=self.mProbe, stop_probe=self.mStop_probe,
+            #             sm=0, wg=0, max_events=30000, tag_names={v: k for k, v in TAGS.items()}, limit=100
+            # )
 
         return output_embedding
