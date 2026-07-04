@@ -219,6 +219,7 @@ class Matmul:
             if warpgroup.group_tidx == 0:
                 range_start(mStart_probe, s_cnt, cute.arch.block_idx()[0], TAGS["LOAD_B"], warpgroup.group_id)
                 s_cnt += 1
+                
         # ---- prologue: prefetch a SINGLE stage ----
         expect_tx(stage)
         load_B(stage, 0)

@@ -11,7 +11,7 @@ from cutlass import Float32, BFloat16
 
 from transformer_megakernel.kernel_utils import (
     ld_acquire_u32, atomic_add_release,
-    fence_proxy_async_shared_cta, fence_proxy_async_global, 
+    fence_proxy_async_shared_cta, fence_proxy_async_global,
     WarpgroupMeta, PipelineMeta, Phases,
     range_start, range_stop, TAGS
 )
@@ -119,7 +119,7 @@ class Attention:
 
     @cute.jit
     def _warpgroup_sync(self, *, group_id):
-        cute.arch.barrier(barrier_id=12 + group_id, number_of_threads=128)
+        cute.arch.barrier(barrier_id = 12 + group_id, number_of_threads = 128)
 
     @cute.jit
     def load_Q(self, thread_Q_gmem, thread_Q_shared, gmem_tiled_copy):
@@ -349,7 +349,7 @@ class Attention:
                 s_cnt += 1
                 range_start(mStart_probe, s_cnt, cute.arch.block_idx()[0], TAGS["LOAD_K"], warpgroup.group_id)
                 s_cnt += 1
-                
+
         load_Q()
         load_K(0)
         # Q is shared across every KV block -> stage it smem -> rmem exactly once.
@@ -391,12 +391,13 @@ class Attention:
         last = n_kv - 1
         for n in cutlass.range(last):
             acc_S.fill(0.0)
+
             # K_n is already in smem; start loading V_n while QK compute runs
             if cutlass.const_expr(self.profile):
                 if warpgroup.group_tidx == 0:
                     range_start(mStart_probe, s_cnt, cute.arch.block_idx()[0], TAGS["LOAD_V"], warpgroup.group_id)
                     s_cnt += 1
-                
+
             load_V(n)
 
             cute.arch.cp_async_wait_group(1)       # K_n has landed; V_n still in flight
@@ -408,6 +409,7 @@ class Attention:
                     st_cnt += 1
                     range_start(mStart_probe, s_cnt, cute.arch.block_idx()[0], TAGS["COMPUTE_QK"], warpgroup.group_id)
                     s_cnt += 1
+
             gemm_QK()
 
             # Prefetch next K while PV is computed
@@ -420,7 +422,7 @@ class Attention:
                     s_cnt += 1
 
             load_K(n + 1)      # prefetch next K
-            
+
             if cutlass.const_expr(self.profile):
                 if warpgroup.group_tidx == 0:
                     range_start(mStart_probe, s_cnt, cute.arch.block_idx()[0], TAGS["ROW_REDUCE_SOFTMAX"], warpgroup.group_id)
@@ -443,6 +445,7 @@ class Attention:
                     s_cnt += 1
             #                     cute.arch.block_idx()[0], TAGS["COMPUTE_PV"])
             gemm_PV()
+
             if cutlass.const_expr(self.profile):
                 if warpgroup.group_tidx == 0:
                     range_stop(mStop_probe, st_cnt, cute.arch.block_idx()[0], TAGS["COMPUTE_PV"], warpgroup.group_id)
@@ -453,7 +456,7 @@ class Attention:
             if warpgroup.group_tidx == 0:
                 range_start(mStart_probe, s_cnt, cute.arch.block_idx()[0], TAGS["LOAD_V"], warpgroup.group_id)
                 s_cnt += 1
-            
+
         acc_S.fill(0.0)
         load_V(last)
         cute.arch.cp_async_wait_group(1)
@@ -505,13 +508,17 @@ class Attention:
         # ---- write O into the output section, AFTER the output barrier ----
         rO_bf = cute.make_fragment_like(acc_O, BFloat16)
         cute.arch.mbarrier_wait(output_bar_me, phases.output_phase)
+
         if cutlass.const_expr(self.profile):
             if warpgroup.group_tidx == 0:
                 range_start(mStart_probe, s_cnt, cute.arch.block_idx()[0], TAGS["ATTENTION_STORE"], warpgroup.group_id)
                 s_cnt += 1
+
         rO_bf.store(acc_O.load().to(BFloat16))
 
-        smem_store_bf  = cute.make_copy_atom(warp.StMatrix8x8x16bOp(num_matrices=4), BFloat16)
+        smem_store_bf  = cute.make_copy_atom(
+            warp.StMatrix8x8x16bOp(num_matrices=4), BFloat16
+        )
         smem_thr_Ow = cute.make_tiled_copy_C(smem_store_bf, tiled_mma_pv).get_slice(group_tid)
         smem_O_acc  = smem_thr_Ow.partition_D(sO)
         reg_O_acc   = smem_thr_Ow.retile(rO_bf)
@@ -537,4 +544,5 @@ class Attention:
             if warpgroup.group_tidx == 0:
                 range_stop(mStop_probe, st_cnt, cute.arch.block_idx()[0], TAGS["ATTENTION_STORE"], warpgroup.group_id)
                 st_cnt += 1
+
         return s_cnt, st_cnt
