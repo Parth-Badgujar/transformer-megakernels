@@ -21,13 +21,8 @@ def runner():
     if not os.path.exists(".venv"):
         subprocess.run(["uv", "venv", "--python", "3.12"])
     subprocess.run(["uv", "sync"])
-    # Run test.py with profiling to verify profiler + JSON trace dump
     result = subprocess.run(
-        ["uv", "run", "python3", "-u", "test.py",
-         "--num_iters", "1000",
-         "--num_rounds", "100",
-         "--profile",
-         "--trace_path", "pipeline_trace.json"],
+        ["uv", "run", "python3", "-u", "test.py", "--num_rounds", "1000"],
     )
     vol.commit()
     return result.returncode
@@ -46,6 +41,5 @@ def main():
             else:
                 print(f"Uploading file {file}")
                 batch.put_file(file, file)
-    # .remote() blocks until the function completes and returns — modal exits after
     rc = runner.remote()
     print(f"\nRunner exited with code: {rc}")

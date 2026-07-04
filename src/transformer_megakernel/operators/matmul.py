@@ -1,4 +1,5 @@
 import math
+import logging
 from dataclasses import dataclass
 from functools import partial
 from typing import Callable
@@ -38,8 +39,11 @@ class MatmulConfig:
         assert self.output_pad in (0, 8, 16)
 
 
+logger = logging.getLogger(__name__)
+
 class Matmul:
-    def __init__(self, config: MatmulConfig, epilogue: Callable, profile: bool):
+    def __init__(self, config: MatmulConfig, epilogue: Callable, profile: bool = False):
+        logger.info(f"Initializing Matmul operator with config: bM={config.bM}, bN={config.bN}, bK={config.bK}")
         self.config   = config
         self.epilogue = epilogue
         self.profile = profile
@@ -160,11 +164,9 @@ class Matmul:
         tCrC = cute.make_rmem_tensor(acc_shape, Float32)
         tCrC.fill(0.0)
 
-        ldmatrix = warp.LdMatrix8x8x16bOp(transpose=False, num_matrices=4)
-        ca = cute.make_copy_atom(ldmatrix, BFloat16)
-        cb = cute.make_copy_atom(ldmatrix, BFloat16)
-        thr_copy_A = cute.make_tiled_copy_A(ca, tiled_mma).get_slice(warpgroup.group_tidx)
-        thr_copy_B = cute.make_tiled_copy_B(cb, tiled_mma).get_slice(warpgroup.group_tidx)
+        ldmatrix = cute.make_copy_atom(warp.LdMatrix8x8x16bOp(transpose=False, num_matrices=4), BFloat16)
+        thr_copy_A = cute.make_tiled_copy_A(ldmatrix, tiled_mma).get_slice(warpgroup.group_tidx)
+        thr_copy_B = cute.make_tiled_copy_B(ldmatrix, tiled_mma).get_slice(warpgroup.group_tidx)
 
         load_bar = storage.barriers.load_barrier.data_ptr()
 

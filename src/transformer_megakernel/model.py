@@ -1,6 +1,9 @@
+import logging
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+logger = logging.getLogger(__name__)
 
 class RMSNormLayer(nn.Module):
     def __init__(
@@ -114,6 +117,7 @@ class Transformer(nn.Module):
         device: str | torch.device = "cuda"
     ):
         super().__init__()
+        logger.info(f"Initializing Transformer model with embed_dim={embed_dim}, num_layers={num_layers}, q_heads={num_q_heads}, kv_heads={num_kv_heads}")
         self.layers = nn.ModuleList([
             TransformerLayer(
                 embed_dim, num_q_heads, num_kv_heads, ff_dim, is_causal, dtype = dtype, device = device
@@ -128,6 +132,7 @@ class Transformer(nn.Module):
 
 
 def extract_weights(model: Transformer):
+    logger.info("Extracting weights from Transformer model")
     rms_w = []
     qkv_w = []
     out_w = []

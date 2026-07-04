@@ -1,4 +1,5 @@
 import json
+import heapq
 import torch
 import cutlass
 from cutlass._mlir import ir
@@ -174,7 +175,6 @@ def range_stop(stop_probe, row, sm_val, tag_val, warpgroup):
     stop_probe[row, sm_val, warpgroup, 1] = cutlass.Int64(tag_val)
 
 
-import heapq
 
 def dump_probe(
     start_probe: torch.Tensor,

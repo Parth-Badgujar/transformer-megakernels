@@ -1,15 +1,21 @@
 [project]
 name = "transformer-megakernel"
 version = "0.1.0"
-description = "Megakernel for Transformer in CuTe/CUTLASS DSL"
+description = "Megakernel for transformer in CuTe/CUTLASS DSL"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "matplotlib>=3.10.9",
     "modal>=1.4.3",
     "nvidia-cutlass-dsl[cu13]>=4.5.2",
+    "omegaconf",
     "torch>=2.11.0",
-    "tqdm"
+    "tqdm",
+]
+
+[project.optional-dependencies]
+benchmark = [
+    "torch-tensorrt>=2.12.1",
 ]
 
 [build-system]

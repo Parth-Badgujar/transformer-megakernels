@@ -1,5 +1,6 @@
-from matplotlib import container
+
 import math
+import logging
 from functools import partial
 
 import cutlass
@@ -38,29 +39,13 @@ class AttentionConfig:
         assert self.stage_elements >= 2 * self.bKV * self.head_dim
 
 
+logger = logging.getLogger(__name__)
+
 class Attention:
-    def __init__(self, config: AttentionConfig, profile: bool):
+    def __init__(self, config: AttentionConfig, profile: bool = False):
+        logger.info(f"Initializing Attention operator with config: bQ={config.bQ}, bKV={config.bKV}, head_dim={config.head_dim}, q_heads={config.num_q_heads}, kv_heads={config.num_kv_heads}")
         self.config = config
         self.profile = profile
-
-    @cute.jit
-    def get_qkvo_layout(self):
-        cfg = self.config
-        layout_atom  = cute.make_composed_layout(
-            cute.make_swizzle(cfg.swizzle_bits, 3, 3), 0,
-            cute.make_layout((8, cfg.smem_k_block), stride = (cfg.smem_k_block, 1)),
-        )
-        sKV_layout = cute.tile_to_shape(layout_atom, (cfg.bKV, cfg.head_dim), (0, 1))
-        sQ_layout  = cute.tile_to_shape(layout_atom, (cfg.bQ,  cfg.head_dim), (0, 1))
-        sO_layout  = cute.make_layout(
-            shape = (cfg.bQ, cfg.head_dim),
-            stride = (cfg.head_dim + cfg.output_pad, 1)
-        )
-        sO_tma_layout = cute.make_layout(
-            shape = (cfg.bQ, cfg.head_dim + cfg.output_pad),
-            stride = (cfg.head_dim + cfg.output_pad, 1)
-        )
-        return sKV_layout, sQ_layout, sO_layout, sO_tma_layout
 
     @cute.jit
     def get_tiled_mma(self):
@@ -266,15 +251,15 @@ class Attention:
         gV  = cute.local_tile(mV[batch_idx, kv_head_idx, None, None], (cfg.bKV, cfg.head_dim), (None, 0))
 
         other = group_id ^ 1
-        self.input_bar_me   = storage.barriers.input_barrier.data_ptr()   + group_id
-        self.input_bar_ot   = storage.barriers.input_barrier.data_ptr()   + other
-        self.compute_bar_me = storage.barriers.compute_barrier.data_ptr() + group_id
-        self.compute_bar_ot = storage.barriers.compute_barrier.data_ptr() + other
-        self.output_bar_me  = storage.barriers.output_barrier.data_ptr()  + group_id
-        self.output_bar_ot  = storage.barriers.output_barrier.data_ptr()  + other
+        input_bar_me   = storage.barriers.input_barrier.data_ptr()   + group_id
+        input_bar_ot   = storage.barriers.input_barrier.data_ptr()   + other
+        compute_bar_me = storage.barriers.compute_barrier.data_ptr() + group_id
+        compute_bar_ot = storage.barriers.compute_barrier.data_ptr() + other
+        output_bar_me  = storage.barriers.output_barrier.data_ptr()  + group_id
+        output_bar_ot  = storage.barriers.output_barrier.data_ptr()  + other
         num_kv_blocks = cfg.kv_len // cfg.bKV
 
-        cute.arch.mbarrier_wait(self.input_bar_me, phases.input_phase)
+        cute.arch.mbarrier_wait(input_bar_me, phases.input_phase)
 
         if group_tid == 0:
             ready = 0
@@ -378,7 +363,7 @@ class Attention:
         warpgroup_sync()
         cute.copy(thr_cpy_Q_V, thr_cpy_Q_V.partition_S(sQ), thr_cpy_Q_V.retile(rmem_tensor_Q_S))
 
-        cute.arch.mbarrier_wait(self.compute_bar_me, phases.compute_phase) # we can remove this it shouldn't matter
+        cute.arch.mbarrier_wait(compute_bar_me, phases.compute_phase)
 
         cS_mn = Attention._reshape_acc_to_mn(
             thr_mma_qk.partition_C(cute.make_identity_tensor((cfg.bQ, cfg.bKV))))
@@ -481,7 +466,7 @@ class Attention:
                 s_cnt += 1
 
         gemm_QK()
-        cute.arch.mbarrier_arrive(self.input_bar_ot)
+        cute.arch.mbarrier_arrive(input_bar_ot)
 
         if cutlass.const_expr(self.profile):
             if warpgroup.group_tidx == 0:
@@ -514,12 +499,12 @@ class Attention:
                 st_cnt += 1
 
         # ---- finalize ----
-        cute.arch.mbarrier_arrive(self.compute_bar_ot)
+        cute.arch.mbarrier_arrive(compute_bar_ot)
         normalize_output()
 
         # ---- write O into the output section, AFTER the output barrier ----
         rO_bf = cute.make_fragment_like(acc_O, BFloat16)
-        cute.arch.mbarrier_wait(self.output_bar_me, phases.output_phase)
+        cute.arch.mbarrier_wait(output_bar_me, phases.output_phase)
         if cutlass.const_expr(self.profile):
             if warpgroup.group_tidx == 0:
                 range_start(mStart_probe, s_cnt, cute.arch.block_idx()[0], TAGS["ATTENTION_STORE"], warpgroup.group_id)
@@ -546,7 +531,7 @@ class Attention:
             cute.arch.sync_warp()
             with cute.arch.elect_one():
                 atomic_add_release((mAtomics.iterator + pipeline.next_idx).toint(), 1)
-        cute.arch.mbarrier_arrive(self.output_bar_ot)
+        cute.arch.mbarrier_arrive(output_bar_ot)
 
         if cutlass.const_expr(self.profile):
             if warpgroup.group_tidx == 0:

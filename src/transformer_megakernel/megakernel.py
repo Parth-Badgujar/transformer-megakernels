@@ -2,6 +2,7 @@ import os
 os.environ["CUTE_DSL_LINEINFO"] = "1"
 
 import math
+import logging
 import torch
 import cutlass
 import cutlass.cute as cute
@@ -30,36 +31,43 @@ from cutlass import Int32, BFloat16, Uint64
 PROBE_COLS = PROBE_HEADER + MAX_TAG_SLOTS * PROBE_ENTRY  # = 1 + 16*4 = 65
 
 
+logger = logging.getLogger(__name__)
+
 class Megakernel:
     def __init__(self, input_config: InputConfig, kernel_config: KernelConfig,
                  profile: bool = False):
-        self.profile      = profile
-        self.embed_dim    = input_config.embed_dim
-        self.kv_len       = input_config.kv_len
-        self.q_len        = input_config.q_len
-        self.num_q_heads  = input_config.num_q_heads
-        self.num_kv_heads = input_config.num_kv_heads
-        self.num_layers   = input_config.num_layers
-        self.ff_dim       = input_config.ff_dim
-        self.num_stages   = kernel_config.num_stages
-        self.head_dim     = input_config.embed_dim // input_config.num_q_heads
-        self.bM           = kernel_config.bM
-        self.bN           = kernel_config.bN
-        self.bK           = kernel_config.bK
-        self.bs           = input_config.bs
-        self.num_sms      = kernel_config.num_sms
-        self.max_works    = kernel_config.max_works
-        self.warps_per_row = kernel_config.warps_per_row
-        self.num_sets      = 4 // self.warps_per_row
-        self.rows_per_rms_block = kernel_config.rows_per_rms_block
-        self.qkv_out_dim  = (input_config.num_q_heads + 2 * input_config.num_kv_heads) * self.head_dim
-        self.num_tokens   = input_config.bs * input_config.q_len
-        self.bQ           = kernel_config.block_q
-        self.bKV          = kernel_config.block_kv
-        self.use_tma_reduce = kernel_config.use_tma_reduce
-        self.output_pad     = kernel_config.output_pad
+        logger.info(f"Initializing Megakernel (profile={profile})")
+        self.profile = profile
+        ic, kc = input_config, kernel_config
 
-        # one stage section must hold the largest of: matmul A+B, attn K+V, rms set
+        # Pass through config values directly
+        self.embed_dim    = ic.embed_dim
+        self.kv_len       = ic.kv_len
+        self.q_len        = ic.q_len
+        self.num_q_heads  = ic.num_q_heads
+        self.num_kv_heads = ic.num_kv_heads
+        self.ff_dim       = ic.ff_dim
+        self.num_stages   = kc.num_stages
+        self.bM           = kc.bM
+        self.bN           = kc.bN
+        self.bK           = kc.bK
+        self.bs           = ic.bs
+        self.num_sms      = kc.num_sms
+        self.max_works    = kc.max_works
+        self.warps_per_row = kc.warps_per_row
+        self.bQ           = kc.block_q
+        self.bKV          = kc.block_kv
+        self.use_tma_reduce = kc.use_tma_reduce
+        self.output_pad   = kc.output_pad
+        self.rows_per_rms_block = kc.rows_per_rms_block
+
+        # Derived quantities
+        self.head_dim     = ic.embed_dim // ic.num_q_heads
+        self.num_sets     = 4 // kc.warps_per_row
+        self.qkv_out_dim  = (ic.num_q_heads + 2 * ic.num_kv_heads) * self.head_dim
+        self.num_tokens   = ic.bs * ic.q_len
+
+        # One stage section must hold the largest of: matmul A+B, attn K+V, rms set
         self.stage_elements = max(
             self.bM * self.bK + self.bN * self.bK,
             2 * self.bKV * self.head_dim,
@@ -67,34 +75,34 @@ class Megakernel:
         )
 
         self.rms_config = RMSNormConfig(
-            embed_dim          = self.embed_dim,
-            bRMS               = self.rows_per_rms_block,
-            stage_elements     = self.stage_elements,
-            warps_per_row      = self.warps_per_row,
+            embed_dim      = self.embed_dim,
+            bRMS           = self.rows_per_rms_block,
+            stage_elements = self.stage_elements,
+            warps_per_row  = self.warps_per_row,
         )
 
         self.matmul_config = MatmulConfig(
-            bM = self.bM,
-            bN = self.bN,
-            bK = self.bK,
-            num_stages = self.num_stages,
+            bM             = self.bM,
+            bN             = self.bN,
+            bK             = self.bK,
+            num_stages     = self.num_stages,
             stage_elements = self.stage_elements,
             use_tma_reduce = self.use_tma_reduce,
-            output_pad = self.output_pad,
+            output_pad     = self.output_pad,
         )
 
         self.attention_config = AttentionConfig(
-            bQ = self.bQ,
-            bKV = self.bKV,
-            q_len = self.q_len,
-            kv_len = self.kv_len,
-            head_dim = self.head_dim,
-            num_q_heads = self.num_q_heads,
-            num_kv_heads = self.num_kv_heads,
-            num_stages = self.num_stages,
+            bQ             = self.bQ,
+            bKV            = self.bKV,
+            q_len          = self.q_len,
+            kv_len         = self.kv_len,
+            head_dim       = self.head_dim,
+            num_q_heads    = self.num_q_heads,
+            num_kv_heads   = self.num_kv_heads,
+            num_stages     = self.num_stages,
             stage_elements = self.stage_elements,
-            output_pad = self.output_pad,
-            is_causal = input_config.is_causal
+            output_pad     = self.output_pad,
+            is_causal      = ic.is_causal,
         )
     @cute.jit
     def _get_shared_storage(self):
@@ -386,16 +394,14 @@ class Megakernel:
         for local_work_idx in cutlass.range(max_works_local):
             work_idx = local_work_idx * 2 + group_id
 
-            op           = mSchedule[block_id, work_idx, 0]
-            pid_m        = mSchedule[block_id, work_idx, 1]
-            pid_n        = mSchedule[block_id, work_idx, 2]
-            pid_o        = mSchedule[block_id, work_idx, 3]
-            expected_cnt = mSchedule[block_id, work_idx, 4]
-            current_idx  = mSchedule[block_id, work_idx, 5]
-            next_idx     = mSchedule[block_id, work_idx, 6]
-
-            op_kind   = op & 0x7
-            layer_idx = op >> 3
+            layer_idx    = mSchedule[block_id, work_idx, 0]
+            op_kind      = mSchedule[block_id, work_idx, 1]
+            pid_m        = mSchedule[block_id, work_idx, 2]
+            pid_n        = mSchedule[block_id, work_idx, 3]
+            pid_o        = mSchedule[block_id, work_idx, 4]
+            expected_cnt = mSchedule[block_id, work_idx, 5]
+            current_idx  = mSchedule[block_id, work_idx, 6]
+            next_idx     = mSchedule[block_id, work_idx, 7]
 
             pipeline = PipelineMeta(
                 current_idx  = current_idx,
@@ -475,6 +481,8 @@ class Megakernel:
 class TransformerMegakernel:
     def __init__(self, model: Transformer, input_config: InputConfig,
                  kernel_config: KernelConfig, profile: bool = False):
+        num_params = sum(p.numel() for p in model.parameters())
+        logger.info(f"Initializing TransformerMegakernel with model parameters: {num_params}, profile: {profile}")
         self.profile    = profile
         self.num_sms    = kernel_config.num_sms
         # 1. Extract weights from model
@@ -504,18 +512,28 @@ class TransformerMegakernel:
 
         self.ws1 = torch.zeros((self.num_tokens, input_config.embed_dim), dtype = torch.bfloat16, device="cuda")
         self.ws2 = torch.zeros((self.num_tokens, self.ws2_dim), dtype = torch.bfloat16, device="cuda")
+        logger.info(f"Allocated workspace 1: {self.ws1.shape}, workspace 2: {self.ws2.shape}")
         self.cWs1 = from_dlpack(self.ws1, assumed_align = 16)
         self.cWs2 = from_dlpack(self.ws2, assumed_align = 16)
 
-        # 5. Allocate probe tensor (always, but only populated when profile=True)
-        #    Shape: (num_sms * NUM_PROBE_ROLES, PROBE_COLS)  — int64 so timestamps fit
-        num_probe_rows = 30000
-        self.mProbe = torch.zeros(
-            (num_probe_rows, self.num_sms, 2, 3), dtype=torch.int64, device="cuda"
-        )
-        self.mStop_probe = torch.zeros(
-            (num_probe_rows, self.num_sms, 2, 2), dtype=torch.int64, device="cuda"
-        )
+        # 5. Allocate probe tensor (only when profile=True)
+        if self.profile:
+            max_k = max(input_config.embed_dim, self.qkv_dim, input_config.ff_dim)
+            max_matmul_events = math.ceil(max_k / kernel_config.bK) * 10
+            max_attn_events = math.ceil(input_config.kv_len / kernel_config.block_kv) * 12
+            max_events_per_work = max(max_matmul_events, max_attn_events, 10)
+            num_probe_rows = max_works * max_events_per_work # Upper bound for maxworks
+
+            self.mProbe = torch.zeros(
+                (num_probe_rows, self.num_sms, 2, 3), dtype=torch.int64, device="cuda"
+            )
+            self.mStop_probe = torch.zeros(
+                (num_probe_rows, self.num_sms, 2, 2), dtype=torch.int64, device="cuda"
+            )
+        else:
+            self.mProbe = torch.zeros((1,), dtype=torch.int64, device="cuda")
+            self.mStop_probe = torch.zeros((1,), dtype=torch.int64, device="cuda")
+            
         self.cProbe = from_dlpack(self.mProbe, assumed_align = 16)
         self.cStop_mProbe = from_dlpack(self.mStop_probe, assumed_align = 16)
 
@@ -552,9 +570,6 @@ class TransformerMegakernel:
 
         if self.profile:
             torch.cuda.synchronize()
-            dump_probe(self.mProbe, self.mStop_probe, self.num_sms, max_events= 30000, out_path=trace_path)
-            # debug_pairs(start_probe=self.mProbe, stop_probe=self.mStop_probe,
-            #             sm=0, wg=0, max_events=30000, tag_names={v: k for k, v in TAGS.items()}, limit=100
-            # )
+            dump_probe(self.mProbe, self.mStop_probe, self.num_sms, max_events=30000, out_path=trace_path)
 
         return output_embedding

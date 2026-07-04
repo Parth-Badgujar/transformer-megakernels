@@ -1,4 +1,5 @@
 import math
+import logging
 from functools import partial
 from dataclasses import dataclass
 
@@ -30,8 +31,11 @@ class RMSNormConfig:
         assert self.embed_dim % (32 * self.warps_per_row) == 0, "Embed dim should be divisible by (32 * warps_per_row)"
 
 
+logger = logging.getLogger(__name__)
+
 class RMSNorm:
-    def __init__(self, config: RMSNormConfig, profile = False):
+    def __init__(self, config: RMSNormConfig, profile: bool = False):
+        logger.info(f"Initializing RMSNorm operator with config: embed_dim={config.embed_dim}, bRMS={config.bRMS}")
         self.config = config
         self.profile = profile
 
