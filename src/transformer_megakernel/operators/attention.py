@@ -58,7 +58,7 @@ class Attention:
         )
         tiled_mma_pv = cute.make_tiled_mma(
             warp.MmaF16BF16Op(BFloat16, Float32, (16, 8, 16)),
-            (warpM, warpN, 1), permutation_mnk = (cfg.bQ, cfg.head_dim, cfg.bKV),
+            (warpM, 1, warpN), permutation_mnk = (cfg.bQ, cfg.head_dim, cfg.bKV),
         )
         return tiled_mma_qk, tiled_mma_pv
 
@@ -225,13 +225,10 @@ class Attention:
 
         warpgroup_sync = partial(self._warpgroup_sync, group_id=group_id)
 
-        smem_k_block = 64 if  cfg.head_dim % 64 == 0 else 32
-        swizzle_bits = 3 if smem_k_block == 64 else 2
-
         layout_atom  = cute.make_composed_layout(
-            cute.make_swizzle(swizzle_bits, 3, 3),
+            cute.make_swizzle(3, 3, 3),
             0,
-            cute.make_layout((8, smem_k_block), stride = (smem_k_block, 1)),
+            cute.make_layout((8, 64), stride = (64, 1)),
         )
 
         sKV_layout = cute.tile_to_shape(layout_atom, (cfg.bKV, cfg.head_dim), (0, 1))
@@ -242,11 +239,11 @@ class Attention:
             stride = (cfg.head_dim + cfg.output_pad, 1)
         )
         sO_tma_layout = cute.make_layout(
-            shape = (cfg.bQ,  cfg.head_dim + cfg.output_pad),
+            shape = (cfg.bQ, cfg.head_dim + cfg.output_pad),
             stride = (cfg.head_dim + cfg.output_pad, 1)
         )
 
-        gQ  = cute.local_tile(mQ[batch_idx, q_head_idx,    None, None], (cfg.bQ,  cfg.head_dim), (query_block_idx,   0))
+        gQ  = cute.local_tile(mQ[batch_idx, q_head_idx,  None, None], (cfg.bQ,  cfg.head_dim), (query_block_idx, 0))
         gK  = cute.local_tile(mK[batch_idx, kv_head_idx, None, None], (cfg.bKV, cfg.head_dim), (None, 0))
         gV  = cute.local_tile(mV[batch_idx, kv_head_idx, None, None], (cfg.bKV, cfg.head_dim), (None, 0))
 
@@ -352,6 +349,7 @@ class Attention:
 
         load_Q()
         load_K(0)
+
         # Q is shared across every KV block -> stage it smem -> rmem exactly once.
         cute.arch.cp_async_wait_group(1)   # K_0 still in flight while Q has landed
 
