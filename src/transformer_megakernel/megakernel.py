@@ -21,7 +21,7 @@ from transformer_megakernel.kernel_utils import (
     WarpgroupMeta, Phases, PipelineMeta,
     PROBE_HEADER, PROBE_ENTRY, MAX_TAG_SLOTS, NUM_PROBE_ROLES,
     ROLE_NAMES, TAG_NAMES, TAGS,
-    dump_probe, debug_pairs
+    dump_probe
 )
 
 from cutlass import Int32, BFloat16, Uint64
