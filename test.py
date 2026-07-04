@@ -1,3 +1,4 @@
+import os
 import time
 import torch
 import logging
@@ -14,6 +15,8 @@ parser.add_argument("--config", type=str, default="configs/default.yaml")
 parser.add_argument("--num_rounds", type=int, default=100)
 parser.add_argument("--out-dir", type = str, default = "output")
 args = parser.parse_args()
+
+os.makedirs(args.out_dir, exist_ok=True)
 
 num_sms = torch.cuda.get_device_properties(0).multi_processor_count
 torch.manual_seed(42)
