@@ -368,17 +368,39 @@ class Attention:
 
         # Bind the accumulators / staging buffers so the mainloop reads like the math.
         gemm_QK = partial(self.gemm_QK,
-            acc_S=acc_S, frag_Q=rmem_tensor_Q_S, frag_K=rmem_tensor_K_S,
-            thr_cpy_K=thr_cpy_K_V, sK=sK, tiled_mma_qk=tiled_mma_qk, warpgroup_sync=warpgroup_sync)
+            acc_S = acc_S,
+            frag_Q = rmem_tensor_Q_S,
+            frag_K = rmem_tensor_K_S,
+            thr_cpy_K = thr_cpy_K_V,
+            sK = sK,
+            tiled_mma_qk = tiled_mma_qk,
+            warpgroup_sync = warpgroup_sync
+        )
         gemm_PV = partial(self.gemm_PV,
-            acc_O=acc_O, frag_P=rmem_tesor_P_O, frag_V=rmem_tensor_V_O,
-            thr_cpy_V=thr_cpy_V_P, sVt=sVt, tiled_mma_pv=tiled_mma_pv, warpgroup_sync=warpgroup_sync)
+            acc_O = acc_O,
+            frag_P = rmem_tesor_P_O,
+            frag_V = rmem_tensor_V_O,
+            thr_cpy_V = thr_cpy_V_P,
+            sVt = sVt,
+            tiled_mma_pv = tiled_mma_pv,
+            warpgroup_sync = warpgroup_sync
+        )
         row_reduce_softmax = partial(self.row_reduce_softmax,
-            acc_S=acc_S, acc_O=acc_O, frag_P=rmem_tesor_P, row_max=row_max, row_sum=row_sum,
-            num_rows_per_thr=num_rows_per_thr, softmax_scale_log2=softmax_scale_log2,
-            cS_mn=cS_mn, num_cols_per_thr=num_cols_per_thr)
+            acc_S = acc_S,
+            acc_O = acc_O,
+            frag_P = rmem_tesor_P,
+            row_max = row_max,
+            row_sum = row_sum,
+            num_rows_per_thr = num_rows_per_thr,
+            softmax_scale_log2 = softmax_scale_log2,
+            cS_mn = cS_mn,
+            num_cols_per_thr = num_cols_per_thr
+        )
         normalize_output = partial(self.normalize_output,
-            acc_O=acc_O, row_sum=row_sum, num_rows_per_thr=num_rows_per_thr)
+            acc_O = acc_O,
+            row_sum = row_sum,
+            num_rows_per_thr = num_rows_per_thr
+        )
 
         # ---- mainloop: KV blocks 0 .. N-2, each prefetching the next K ----
         if cutlass.const_expr(cfg.is_causal):

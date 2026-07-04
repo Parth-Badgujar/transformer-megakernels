@@ -51,14 +51,14 @@ profiled_megakernel = TransformerMegakernel(
 )
 
 logger.info(f"Warmup Profiler pass, trace -> {args.trace_path}")
-for _ in range(3):
+for _ in range(5):
     profiled_megakernel(input_embeddings.view(-1, input_config.embed_dim))
 torch.cuda.synchronize()
 
 logger.info(f"Running profiled pass, trace -> {args.trace_path}")
 profiled_output = profiled_megakernel(
     input_embeddings.view(-1, input_config.embed_dim),
-    trace_path=args.trace_path,
+    trace_path = args.trace_path,
 )
 torch.cuda.synchronize()
 logger.info(f"Trace written to: {args.trace_path}")

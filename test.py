@@ -12,6 +12,7 @@ from transformer_megakernel.model import Transformer
 parser = argparse.ArgumentParser()
 parser.add_argument("--config", type=str, default="configs/default.yaml")
 parser.add_argument("--num_rounds", type=int, default=100)
+parser.add_argument("--out-dir", type = str, default = "output")
 args = parser.parse_args()
 
 num_sms = torch.cuda.get_device_properties(0).multi_processor_count
@@ -30,25 +31,25 @@ kernel_config_dict['max_works'] = 0
 kernel_config = KernelConfig(**kernel_config_dict)
 
 model = Transformer(
-    embed_dim=input_config.embed_dim,
-    num_q_heads=input_config.num_q_heads,
-    num_kv_heads=input_config.num_kv_heads,
-    ff_dim=input_config.ff_dim,
-    num_layers=input_config.num_layers,
-    is_causal=input_config.is_causal,
-    dtype=torch.bfloat16,
-    device="cuda"
+    embed_dim = input_config.embed_dim,
+    num_q_heads = input_config.num_q_heads,
+    num_kv_heads = input_config.num_kv_heads,
+    ff_dim = input_config.ff_dim,
+    num_layers = input_config.num_layers,
+    is_causal = input_config.is_causal,
+    dtype = torch.bfloat16,
+    device = "cuda"
 ).eval()
 
 model_f32 = Transformer(
-    embed_dim=input_config.embed_dim,
-    num_q_heads=input_config.num_q_heads,
-    num_kv_heads=input_config.num_kv_heads,
-    ff_dim=input_config.ff_dim,
-    num_layers=input_config.num_layers,
-    is_causal=input_config.is_causal,
-    dtype=torch.float32,
-    device="cuda"
+    embed_dim = input_config.embed_dim,
+    num_q_heads = input_config.num_q_heads,
+    num_kv_heads = input_config.num_kv_heads,
+    ff_dim = input_config.ff_dim,
+    num_layers = input_config.num_layers,
+    is_causal = input_config.is_causal,
+    dtype = torch.float32,
+    device = "cuda"
 ).eval()
 
 for n, p in model.named_parameters():
@@ -110,11 +111,11 @@ logger.info(f"Min  (mean errs): {min(mean_errs)}")
 logger.info(f"Min  (rel errs): {min(rel_errs)}")
 
 if args.num_rounds > 1:
-    np.save("max_errs.npy", np.array(max_errs))
-    np.save("mean_errs.npy", np.array(mean_errs))
+    np.save(os.path.join(args.out_dir, "max_errs.npy"), np.array(max_errs))
+    np.save(os.path.join(args.out_dir, "mean_errs.npy"), np.array(mean_errs))
     for name, data in (("max_errs", max_errs), ("mean_errs", mean_errs)):
         plt.figure()
         _, _, patches = plt.hist(np.array(data))
         plt.bar_label(patches)
-        plt.savefig(f"{name}.png")
+        plt.savefig(os.path.join(args.out_dir, f"{name}.png"))
         plt.close()
