@@ -22,7 +22,8 @@ from transformer_megakernel.kernel_utils import (
     WarpgroupMeta, Phases, PipelineMeta,
     PROBE_HEADER, PROBE_ENTRY, MAX_TAG_SLOTS, NUM_PROBE_ROLES,
     ROLE_NAMES, TAG_NAMES, TAGS,
-    dump_probe
+    dump_probe,
+    clock64, globaltimer,
 )
 
 from cutlass import Int32, BFloat16, Uint64
@@ -144,7 +145,8 @@ class Megakernel:
         mOutProjAttn: cute.Tensor,
         mEmbedding:   cute.Tensor,
         mProbe: cute.Tensor,
-        mStop_probe:  cute.Tensor
+        mStop_probe:  cute.Tensor,
+        mClockOffsets: cute.Tensor
     ):
         q_layout  = cute.make_layout(
             shape  = (self.bs, self.num_q_heads,  self.q_len, self.head_dim),
@@ -273,11 +275,11 @@ class Megakernel:
         self.up      = Matmul(self.matmul_config, basic_store,          profile=self.profile)
         self.gate    = Matmul(self.matmul_config, silu_mul,             profile=self.profile)
         self.down    = Matmul(self.matmul_config, residual_add_store,   profile=self.profile)
-        self.attn    = Attention(self.attention_config,                  profile=self.profile)
+        self.attn    = Attention(self.attention_config,                 profile=self.profile)
 
         SharedStorage = self._get_shared_storage()
 
-        self.kernel(mProbe, mStop_probe, mSchedule, mAtomics,
+        self.kernel(mProbe, mStop_probe, mClockOffsets, mSchedule, mAtomics,
                 g_RMS_inp, g_RMS_out, mRMS_weights,
                 g_QKV_inp, g_QKV_act, g_QKV_wt,
                 g_OUT_inp, g_OUT_out, g_OUT_wt, g_OUT_out_nt,
@@ -301,6 +303,7 @@ class Megakernel:
     def kernel(self,
         mProbe: cute.Tensor,
         mStop_probe: cute.Tensor,
+        mClockOffsets: cute.Tensor,
         mSchedule: cute.Tensor,
         mAtomics: cute.Tensor,
         g_RMS_inp: cute.Tensor, g_RMS_out: cute.Tensor, mRMS_weights: cute.Tensor,
@@ -319,12 +322,22 @@ class Megakernel:
         tma_ATTN_out: cute.CopyAtom, g_ATTN_out: cute.Tensor,
         SharedStorage: cutlass.Constexpr
     ):
+        # Read both timers at the very start to compute per-SM clock offset.
+        # globaltimer is synchronized across SMs; clock64 is per-SM but higher resolution.
+        # offset = globaltimer - clock64, stored once per SM for post-processing.
+        gt = globaltimer()
+        c64 = clock64()
+
         warp_id    = cute.arch.warp_idx()
         group_id   = warp_id // 4
         local_warp = warp_id %  4
         tidx       = cute.arch.thread_idx()[0]
         group_tid  = tidx - group_id * 128
         block_id   = cute.arch.block_idx()[0]
+
+        # Store clock offset once per block (thread 0 writes)
+        if tidx == 0:
+            mClockOffsets[block_id] = gt - c64
 
         warpgroup = WarpgroupMeta(
             tidx       = tidx,
@@ -531,17 +544,21 @@ class TransformerMegakernel:
                 (num_probe_rows, self.num_sms, 2, 2), dtype=torch.int64, device="cuda"
             )
         else:
-            self.mProbe = torch.zeros((1,), dtype=torch.int64, device="cuda")
-            self.mStop_probe = torch.zeros((1,), dtype=torch.int64, device="cuda")
+            self.mProbe = torch.zeros((1,), dtype = torch.int64, device = "cuda")
+            self.mStop_probe = torch.zeros((1,), dtype = torch.int64, device = "cuda")
             
         self.cProbe = from_dlpack(self.mProbe, assumed_align = 16)
         self.cStop_mProbe = from_dlpack(self.mStop_probe, assumed_align = 16)
 
+        # Per-SM clock offset tensor: offset[sm] = globaltimer - clock64 at kernel start
+        self.mClockOffsets = torch.zeros((self.num_sms,), dtype = torch.int64, device="cuda")
+        self.cClockOffsets = from_dlpack(self.mClockOffsets, assumed_align = 16)
+
         # 6. Compile the kernel
-        self.kernel = Megakernel(input_config, kernel_config, profile=profile)
+        self.kernel = Megakernel(input_config, kernel_config, profile = profile)
 
         # Dummy compilation embedding
-        dummy_emb = torch.empty((self.num_tokens, input_config.embed_dim), dtype=torch.bfloat16, device="cuda")
+        dummy_emb = torch.empty((self.num_tokens, input_config.embed_dim), dtype = torch.bfloat16, device = "cuda")
         cDummyEmb = from_dlpack(dummy_emb, assumed_align = 16)
 
         self.compiled_kernel = cute.compile(
@@ -549,7 +566,7 @@ class TransformerMegakernel:
             self.cSchedule, self.cAtomics,
             self.cRms_w, self.cQkv_w, self.cWs1, self.cWs2,
             self.cGate_w, self.cUp_w, self.cDown_w, self.cOut_w,
-            cDummyEmb, self.cProbe, self.cStop_mProbe
+            cDummyEmb, self.cProbe, self.cStop_mProbe, self.cClockOffsets
         )
 
     def __call__(self, input_embedding: torch.Tensor,
@@ -558,6 +575,7 @@ class TransformerMegakernel:
         if self.profile:
             self.mProbe.zero_()
             self.mStop_probe.zero_()
+            self.mClockOffsets.zero_()
         output_embedding = input_embedding.clone()
         cEmbedding = from_dlpack(output_embedding, assumed_align = 16)
 
@@ -565,11 +583,13 @@ class TransformerMegakernel:
             self.cSchedule, self.cAtomics,
             self.cRms_w, self.cQkv_w, self.cWs1, self.cWs2,
             self.cGate_w, self.cUp_w, self.cDown_w, self.cOut_w,
-            cEmbedding, self.cProbe, self.cStop_mProbe
+            cEmbedding, self.cProbe, self.cStop_mProbe, self.cClockOffsets
         )
 
         if self.profile:
             torch.cuda.synchronize()
-            dump_probe(self.mProbe, self.mStop_probe, self.num_sms, max_events=30000, out_path=trace_path)
+            dump_probe(self.mProbe, self.mStop_probe, self.num_sms,
+                       max_events = 30000, out_path = trace_path,
+                       clock_offsets=self.mClockOffsets)
 
         return output_embedding

@@ -115,10 +115,26 @@ TAGS = {v:k for k, v in TAG_NAMES.items()}
 
 
 @dsl_user_op
-def globaltimer_u64(*, loc=None, ip=None) -> cutlass.Int64:
+def clock64(*, loc=None, ip=None) -> cutlass.Int64:
+    """Read per-SM %clock64 — high resolution but NOT synchronized across SMs."""
     t = llvm.inline_asm(
         T.i64(), [],
         "mov.u64 $0, %clock64;",
+        "=l",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc, ip=ip,
+    )
+    return cutlass.Int64(t)
+
+
+@dsl_user_op
+def globaltimer(*, loc=None, ip=None) -> cutlass.Int64:
+    """Read %globaltimer — synchronized across all SMs (lower resolution)."""
+    t = llvm.inline_asm(
+        T.i64(), [],
+        "mov.u64 $0, %globaltimer;",
         "=l",
         has_side_effects=True,
         is_align_stack=False,
@@ -167,11 +183,11 @@ def range_start(start_probe, row, sm_val, tag_val, warpgroup):
     """
     start_probe[row, sm_val, warpgroup, 0] = cutlass.Int64(tag_val)
     start_probe[row, sm_val, warpgroup, 1] = cutlass.Int64(warpgroup)
-    start_probe[row, sm_val, warpgroup, 2] = globaltimer_u64()
+    start_probe[row, sm_val, warpgroup, 2] = clock64()
 
 
 def range_stop(stop_probe, row, sm_val, tag_val, warpgroup):
-    stop_probe[row, sm_val, warpgroup, 0] = globaltimer_u64()
+    stop_probe[row, sm_val, warpgroup, 0] = clock64()
     stop_probe[row, sm_val, warpgroup, 1] = cutlass.Int64(tag_val)
 
 
@@ -182,194 +198,98 @@ def dump_probe(
     num_sms: int,
     max_events,
     out_path: str = "pipeline_trace.json",
+    clock_offsets: torch.Tensor = None,
 ):
-    """Convert range_start/range_stop probe tensors into a Perfetto/Chrome
-    Trace Event Format JSON file.
+    """Convert range_start/range_stop probe tensors into a Perfetto JSON trace.
 
-    Expected shapes:
-        start_probe: [max_events, num_sms, 2, 3]   # fields: tag, warpgroup, ts_ns
-        stop_probe:  [max_events, num_sms, 2, 3]    # fields: ts_ns, tag, (unused)
+    Shapes:
+        start_probe : [max_events, num_sms, 2, 3]  — (tag, warpgroup, timestamp)
+        stop_probe  : [max_events, num_sms, 2, 2]  — (timestamp, tag)
 
-    Mapping to Perfetto:
-        SM index        -> pid (process)   one swimlane per SM
-        warpgroup index -> base tid        one sub-row per warpgroup within that SM
-
-    A single tid/track can only show one slice at a time (Perfetto enforces
-    strict LIFO nesting per track and drops the second of any overlapping
-    pair — see slice_drop_overlapping_complete_event). So when two tags
-    within the same (sm, wg) genuinely overlap in time, the second one is
-    assigned an extra "lane" tid (wg, wg+0.001, wg+0.002, ...) so it draws
-    on its own sub-row instead of being dropped. Lanes are reused once
-    freed, so most of the time you still just see one row per warpgroup,
-    and extra rows only appear during actual concurrent overlap, matching
-    the LOAD_A/LOAD_B-stacked-rows look.
-
-    Rows with tag_val == 0 are unused/empty slots and are skipped.
-
-    Start/stop events sharing the same (sm, warpgroup, tag) are paired in
-    row order: the 1st start for that tag pairs with the 1st stop for that
-    tag, the 2nd with the 2nd, etc. This is correct both for properly
-    nested (LIFO) ranges and for non-nested (FIFO) ranges of the same tag.
+    Perfetto mapping:  SM → pid,  warpgroup → tid (with lane sub-rows for overlap).
+    Start/stop pairs with the same (sm, wg, tag) are matched in row order.
     """
-    SENTINEL_TAG = 0
-    NUM_WARPGROUPS = 2
+    NUM_WG = 2
 
     start_np = start_probe.detach().cpu().numpy()
-    stop_np = stop_probe.detach().cpu().numpy()
-
+    stop_np  = stop_probe.detach().cpu().numpy()
+    offsets  = clock_offsets.detach().cpu().numpy() if clock_offsets is not None else None
     max_rows = min(max_events, start_np.shape[0], stop_np.shape[0])
 
-    starts = defaultdict(list)  # (sm, wg, tag) -> [(row, ts_ns), ...]
-    stops = defaultdict(list)   # (sm, wg, tag) -> [(row, ts_ns), ...]
+    # ── Gather start/stop timestamps keyed by (sm, wg, tag) ──────────────
+    starts = defaultdict(list)
+    stops  = defaultdict(list)
 
     for row in range(max_rows):
         for sm in range(num_sms):
-            for wg in range(NUM_WARPGROUPS):
+            off = int(offsets[sm]) if offsets is not None else 0
+            for wg in range(NUM_WG):
                 s_tag = int(start_np[row, sm, wg, 0])
-                if s_tag != SENTINEL_TAG:
-                    s_ts = int(start_np[row, sm, wg, 2])
-                    starts[(sm, wg, s_tag)].append((row, s_ts))
-
+                if s_tag:
+                    starts[(sm, wg, s_tag)].append(int(start_np[row, sm, wg, 2]) + off)
                 e_tag = int(stop_np[row, sm, wg, 1])
-                if e_tag != SENTINEL_TAG:
-                    e_ts = int(stop_np[row, sm, wg, 0])
-                    stops[(sm, wg, e_tag)].append((row, e_ts))
+                if e_tag:
+                    stops[(sm, wg, e_tag)].append(int(stop_np[row, sm, wg, 0]) + off)
 
-    # First pass: build the flat list of (sm, wg, tag, start_us, end_us)
-    # events, grouped by (sm, wg) so we can do lane assignment per
-    # warpgroup (lanes must be computed across ALL tags sharing that
-    # warpgroup, since it's the warpgroup's tid that's contended, not the
-    # tag's).
-    events_by_sm_wg = defaultdict(list)  # (sm, wg) -> [event dict, ...]
+    # ── Pair starts/stops → events grouped by (sm, wg) ───────────────────
+    events_by_wg = defaultdict(list)  # (sm, wg) → list of (start_us, end_us, tag)
 
-    all_keys = set(starts.keys()) | set(stops.keys())
-    for (sm, wg, tag) in all_keys:
-        s_list = sorted(starts.get((sm, wg, tag), []), key=lambda x: x[0])
-        e_list = sorted(stops.get((sm, wg, tag), []), key=lambda x: x[0])
+    for key in set(starts) | set(stops):
+        sm, wg, tag = key
+        s_list = starts.get(key, [])
+        e_list = stops.get(key, [])
+        name = TAG_NAMES.get(tag, f"tag_{tag}")
+        for s_ns, e_ns in zip(s_list, e_list):
+            dur = e_ns - s_ns
+            if dur >= 0:
+                events_by_wg[(sm, wg)].append((s_ns / 1000.0, e_ns / 1000.0, tag, name))
 
-        n_pairs = min(len(s_list), len(e_list))
-        tag_name = TAG_NAMES.get(tag, f"tag_{tag}")
-
-        for i in range(n_pairs):
-            _, s_ts_ns = s_list[i]
-            _, e_ts_ns = e_list[i]
-
-            ts_us = s_ts_ns / 1000.0
-            end_us = e_ts_ns / 1000.0
-            dur_us = end_us - ts_us
-
-            if dur_us < 0:
-                continue
-
-            events_by_sm_wg[(sm, wg)].append(
-                {
-                    "start": ts_us,
-                    "end": end_us,
-                    "tag": tag,
-                    "tag_name": tag_name,
-                    "sm": sm,
-                    "wg": wg,
-                }
-            )
-
+    # ── Lane assignment (interval scheduling) + emit trace events ────────
     trace_events = []
+    max_lanes = {}  # (sm, wg) → lane count
 
-    # Second pass: for each (sm, wg), assign lanes via interval scheduling
-    # so overlapping events land on different sub-tids, then emit X events
-    # (back to complete events — simpler and correct now that each lane
-    # only ever has non-overlapping events on it, satisfying Perfetto's
-    # strict-nesting requirement).
-    max_lanes_per_sm_wg = {}  # (sm, wg) -> lane count, used for thread_name metadata
+    for (sm, wg), evs in events_by_wg.items():
+        evs.sort()  # by (start, end)
 
-    for (sm, wg), evs in events_by_sm_wg.items():
-        # Sort by start time; ties broken by end time so shorter events
-        # don't unnecessarily hold a lane open.
-        evs.sort(key=lambda e: (e["start"], e["end"]))
+        free  = []   # min-heap of reusable lane indices
+        active = []  # min-heap of (end_time, lane)
+        next_lane = 0
 
-        free_lanes = []      # heap of available lane indices
-        active = []          # heap of (end_time, lane) currently occupied
+        for start, end, tag, name in evs:
+            # release finished lanes
+            while active and active[0][0] <= start:
+                heapq.heappush(free, heapq.heappop(active)[1])
 
-        for ev in evs:
-            # Free lanes whose occupant has ended at or before this
-            # event's start.
-            while active and active[0][0] <= ev["start"]:
-                _, freed_lane = heapq.heappop(active)
-                heapq.heappush(free_lanes, freed_lane)
-
-            if free_lanes:
-                lane = heapq.heappop(free_lanes)
+            if free:
+                lane = heapq.heappop(free)
             else:
-                lane = len(active) + len(free_lanes)
-                # len(active)+len(free_lanes) undercounts once lanes have
-                # been freed and reused; track the true next-lane index
-                # explicitly instead.
-                lane = max_lanes_per_sm_wg.get((sm, wg), 0)
+                lane = next_lane
+                next_lane += 1
 
-            heapq.heappush(active, (ev["end"], lane))
-            ev["lane"] = lane
+            heapq.heappush(active, (end, lane))
+            max_lanes[(sm, wg)] = max(max_lanes.get((sm, wg), 0), lane + 1)
 
-            max_lanes_per_sm_wg[(sm, wg)] = max(
-                max_lanes_per_sm_wg.get((sm, wg), 0), lane + 1
-            )
+            trace_events.append({
+                "name": name, "cat": "range", "ph": "X",
+                "ts": start, "dur": end - start,
+                "pid": sm, "tid": f"wg{wg}.{lane}",
+                "args": {"tag": tag, "tag_name": name,
+                         "sm": sm, "warpgroup": wg, "lane": lane},
+            })
 
-        for ev in evs:
-            trace_events.append(
-                {
-                    "name": ev["tag_name"],
-                    "cat": "range",
-                    "ph": "X",
-                    "ts": ev["start"],
-                    "dur": ev["end"] - ev["start"],
-                    "pid": sm,
-                    "tid": f"wg{wg}.{ev['lane']}",
-                    "args": {
-                        "tag": ev["tag"],
-                        "tag_name": ev["tag_name"],
-                        "sm": sm,
-                        "warpgroup": wg,
-                        "lane": ev["lane"],
-                    },
-                }
-            )
-
+    # ── Perfetto metadata (process / thread names) ───────────────────────
     for sm in range(num_sms):
-        trace_events.append(
-            {
-                "name": "process_name",
-                "ph": "M",
-                "pid": sm,
-                "tid": 0,
-                "args": {"name": f"SM {sm}"},
-            }
-        )
-        trace_events.append(
-            {
-                "name": "process_sort_index",
-                "ph": "M",
-                "pid": sm,
-                "args": {"sort_index": sm},
-            }
-        )
-        for wg in range(NUM_WARPGROUPS):
-            n_lanes = max_lanes_per_sm_wg.get((sm, wg), 1)
-            for lane in range(n_lanes):
+        trace_events.append({"name": "process_name",       "ph": "M", "pid": sm, "tid": 0,
+                             "args": {"name": f"SM {sm}"}})
+        trace_events.append({"name": "process_sort_index", "ph": "M", "pid": sm,
+                             "args": {"sort_index": sm}})
+        for wg in range(NUM_WG):
+            for lane in range(max_lanes.get((sm, wg), 1)):
                 label = f"Warpgroup {wg}" if lane == 0 else f"Warpgroup {wg} (lane {lane})"
-                trace_events.append(
-                    {
-                        "name": "thread_name",
-                        "ph": "M",
-                        "pid": sm,
-                        "tid": f"wg{wg}.{lane}",
-                        "args": {"name": label},
-                    }
-                )
-
-    trace = {
-        "traceEvents": trace_events,
-        "displayTimeUnit": "ns",
-    }
+                trace_events.append({"name": "thread_name", "ph": "M", "pid": sm,
+                                     "tid": f"wg{wg}.{lane}", "args": {"name": label}})
 
     with open(out_path, "w") as f:
-        json.dump(trace, f)
+        json.dump({"traceEvents": trace_events, "displayTimeUnit": "ns"}, f)
 
     return out_path
