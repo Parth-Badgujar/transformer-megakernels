@@ -18,7 +18,7 @@ def basic_store(*, tiled_mma, tCrC, sC, warpgroup, **_):
     dst = thr_cpy.partition_D(sC)
     cute.copy(store_atom, src, dst)
     fence_proxy_async_shared_cta()
-    cute.arch.barrier(barrier_id = 8 + warpgroup.group_id, number_of_threads = 128)
+    cute.arch.barrier(barrier_id=8 + warpgroup.group_id, number_of_threads=128)
 
 
 @cute.jit
@@ -65,7 +65,7 @@ def silu_mul(*, tiled_mma, tCrC, sC, warpgroup, gC, gC_tma=None, pid_m, pid_n, b
     for n in cutlass.range_constexpr(n_tiles):
         g    = tCrC[None, None, n].load()
         u    = rUp[None, None, n].load().to(cutlass.Float32)
-        silu = g / (cutlass.Float32(1.0) + cute.math.exp(-g, fastmath = True))
+        silu = g / (cutlass.Float32(1.0) + cute.math.exp(-g, fastmath=True))
         rUp[None, None, n].store((silu * u).to(cutlass.BFloat16))
 
     cute.copy(store_atom, thr_cpy.retile(rUp), thr_cpy.partition_D(sC))

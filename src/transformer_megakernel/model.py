@@ -8,11 +8,11 @@ logger = logging.getLogger(__name__)
 class RMSNormLayer(nn.Module):
     def __init__(
         self, dim: int,
-        dtype: torch.dtype = torch.bfloat16,
+        dtype: torch.dtype=torch.bfloat16,
         device: str | torch.device = "cuda"
     ):
         super().__init__()
-        self.weight = nn.Parameter(torch.ones(dim, dtype = dtype, device = device))
+        self.weight = nn.Parameter(torch.ones(dim, dtype=dtype, device = device))
 
     def forward(self, x: torch.Tensor):
         x_f   = x.float()
@@ -28,21 +28,21 @@ class GroupedQueryAttention(nn.Module):
         num_q_heads: int,
         num_kv_heads: int,
         is_causal: bool = False,
-        dtype: torch.dtype = torch.bfloat16,
+        dtype: torch.dtype=torch.bfloat16,
         device: str | torch.device = "cuda"
     ):
         super().__init__()
         self.embed_dim    = embed_dim
         self.num_q_heads  = num_q_heads
-        self.num_kv_heads = num_kv_heads
+        self.num_kv_heads= num_kv_heads
         self.head_dim     = embed_dim // num_q_heads
         self.is_causal    = is_causal
         self.enable_gqa   = (num_q_heads != num_kv_heads)
         self.q_proj_dim  = num_q_heads  * self.head_dim
         self.kv_proj_dim = num_kv_heads * self.head_dim
         packed_qkv_dim   = self.q_proj_dim + 2 * self.kv_proj_dim
-        self.qkv_proj = nn.Linear(embed_dim, packed_qkv_dim, bias = False, dtype = dtype, device = device)
-        self.out_proj = nn.Linear(embed_dim, embed_dim,      bias = False, dtype = dtype, device = device)
+        self.qkv_proj = nn.Linear(embed_dim, packed_qkv_dim, bias = False, dtype=dtype, device = device)
+        self.out_proj = nn.Linear(embed_dim, embed_dim,      bias = False, dtype=dtype, device = device)
 
     def forward(self, x: torch.Tensor):
         bs, seq_len = x.shape[0], x.shape[1]
@@ -64,13 +64,13 @@ class SwiGLU(nn.Module):
         dim: int,
         ff_dim: int,
         bias: bool = False,
-        dtype: torch.dtype = torch.bfloat16,
+        dtype: torch.dtype=torch.bfloat16,
         device: str | torch.device  = "cuda"
     ):
         super().__init__()
-        self.gate_proj = nn.Linear(dim, ff_dim, bias = bias, dtype = dtype, device = device)
-        self.up_proj   = nn.Linear(dim, ff_dim, bias = bias, dtype = dtype, device = device)
-        self.down_proj = nn.Linear(ff_dim, dim, bias = bias, dtype = dtype, device = device)
+        self.gate_proj = nn.Linear(dim, ff_dim, bias = bias, dtype=dtype, device = device)
+        self.up_proj   = nn.Linear(dim, ff_dim, bias = bias, dtype=dtype, device = device)
+        self.down_proj = nn.Linear(ff_dim, dim, bias = bias, dtype=dtype, device = device)
 
     def forward(self, x):
         return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
@@ -88,10 +88,10 @@ class TransformerLayer(nn.Module):
         device: str | torch.device = "cuda"
     ):
         super().__init__()
-        self.norm1 = RMSNormLayer(embed_dim, dtype = dtype, device = device)
-        self.attention  = GroupedQueryAttention(embed_dim, num_q_heads, num_kv_heads, is_causal, dtype = dtype, device = device)
-        self.norm2 = RMSNormLayer(embed_dim, dtype = dtype, device = device)
-        self.feedforward   = SwiGLU(embed_dim, ff_dim, dtype = dtype, device = device)
+        self.norm1 = RMSNormLayer(embed_dim, dtype=dtype, device = device)
+        self.attention = GroupedQueryAttention(embed_dim, num_q_heads, num_kv_heads, is_causal, dtype=dtype, device = device)
+        self.norm2 = RMSNormLayer(embed_dim, dtype=dtype, device = device)
+        self.feedforward = SwiGLU(embed_dim, ff_dim, dtype=dtype, device = device)
 
     def forward(self, x: torch.Tensor):
         residual = x
@@ -113,14 +113,14 @@ class Transformer(nn.Module):
         ff_dim: int,
         num_layers: int,
         is_causal: bool = False,
-        dtype: torch.dtype = torch.bfloat16,
+        dtype: torch.dtype=torch.bfloat16,
         device: str | torch.device = "cuda"
     ):
         super().__init__()
         logger.info(f"Initializing Transformer model with embed_dim={embed_dim}, num_layers={num_layers}, q_heads={num_q_heads}, kv_heads={num_kv_heads}")
         self.layers = nn.ModuleList([
             TransformerLayer(
-                embed_dim, num_q_heads, num_kv_heads, ff_dim, is_causal, dtype = dtype, device = device
+                embed_dim, num_q_heads, num_kv_heads, ff_dim, is_causal, dtype=dtype, device = device
             )
             for _ in range(num_layers)
         ])

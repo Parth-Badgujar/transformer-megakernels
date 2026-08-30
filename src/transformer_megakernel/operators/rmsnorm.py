@@ -48,13 +48,13 @@ class RMSNorm:
         alligment = num_per_thread & (~(num_per_thread - 1))
         num_sets = (4 // cfg.warps_per_row)
         return cute.make_layout(
-            shape = ((lanes_per_row, num_sets), (alligment, num_per_thread // alligment)),
-            stride = ((num_sets * alligment, 1), (num_sets, alligment * num_per_thread * num_sets))
+            shape=((lanes_per_row, num_sets), (alligment, num_per_thread // alligment)),
+            stride=((num_sets * alligment, 1), (num_sets, alligment * num_per_thread * num_sets))
         )
 
     @cute.jit
     def _warpgroup_sync(self, *, group_id):
-        cute.arch.barrier(barrier_id = 10 + group_id, number_of_threads = 128)
+        cute.arch.barrier(barrier_id=10 + group_id, number_of_threads=128)
 
     @cute.jit
     def _load_activations(self, stage_idx, tile_idx, *, warp_id, load_bar,
@@ -103,7 +103,7 @@ class RMSNorm:
             x = warpgroup.warp_id // warps_per_row
             y = warpgroup.warp_id %  warps_per_row
             scratch = cute.make_tensor(
-                cute.recast_ptr(sO[None, None, stage_idx].iterator, dtype = Float32),
+                cute.recast_ptr(sO[None, None, stage_idx].iterator, dtype=Float32),
                 cute.make_layout(shape=(num_sets, warps_per_row)),
             )
             if warpgroup.lane_id == 0:
@@ -119,7 +119,7 @@ class RMSNorm:
 
         mean_sq     = ssq / cfg.embed_dim
         mean_sq_eps = mean_sq + 1e-6
-        scale       = cute.math.rsqrt(mean_sq_eps, fastmath = True)
+        scale       = cute.math.rsqrt(mean_sq_eps, fastmath=True)
         yv          = xv * wv * scale
 
         tXsO = thr.partition_S(sO[None, None, stage_idx])
@@ -168,8 +168,8 @@ class RMSNorm:
         sX = cute.make_tensor(
             storage.stages.data_ptr(),
             cute.make_layout(
-                shape = (num_sets, cfg.embed_dim, num_stages),
-                stride = (cfg.embed_dim, 1, cfg.stage_elements)
+                shape=(num_sets, cfg.embed_dim, num_stages),
+                stride=(cfg.embed_dim, 1, cfg.stage_elements)
             )
         )
         sO = storage.out.get_tensor(

@@ -34,25 +34,25 @@ kernel_config_dict['max_works'] = 0
 kernel_config = KernelConfig(**kernel_config_dict)
 
 model = Transformer(
-    embed_dim = input_config.embed_dim,
-    num_q_heads = input_config.num_q_heads,
-    num_kv_heads = input_config.num_kv_heads,
-    ff_dim = input_config.ff_dim,
-    num_layers = input_config.num_layers,
-    is_causal = input_config.is_causal,
-    dtype = torch.bfloat16,
-    device = "cuda"
+    embed_dim=input_config.embed_dim,
+    num_q_heads=input_config.num_q_heads,
+    num_kv_heads=input_config.num_kv_heads,
+    ff_dim=input_config.ff_dim,
+    num_layers=input_config.num_layers,
+    is_causal=input_config.is_causal,
+    dtype=torch.bfloat16,
+    device="cuda"
 ).eval()
 
 model_f32 = Transformer(
-    embed_dim = input_config.embed_dim,
-    num_q_heads = input_config.num_q_heads,
-    num_kv_heads = input_config.num_kv_heads,
-    ff_dim = input_config.ff_dim,
-    num_layers = input_config.num_layers,
-    is_causal = input_config.is_causal,
-    dtype = torch.float32,
-    device = "cuda"
+    embed_dim=input_config.embed_dim,
+    num_q_heads=input_config.num_q_heads,
+    num_kv_heads=input_config.num_kv_heads,
+    ff_dim=input_config.ff_dim,
+    num_layers=input_config.num_layers,
+    is_causal=input_config.is_causal,
+    dtype=torch.float32,
+    device="cuda"
 ).eval()
 
 for n, p in model.named_parameters():

@@ -121,20 +121,20 @@ class Matmul:
         swizzle = cute.make_swizzle(*cfg.swizzle_bits)
 
         sA_layout = cute.make_layout(
-            shape = (cfg.bM, cfg.bK, cfg.num_stages),
-            stride = (cfg.bK, 1, cfg.stage_elements)
+            shape=(cfg.bM, cfg.bK, cfg.num_stages),
+            stride=(cfg.bK, 1, cfg.stage_elements)
         )
         sB_layout = cute.make_layout(
-            shape = (cfg.bN, cfg.bK, cfg.num_stages),
-            stride = (cfg.bK, 1, cfg.stage_elements)
+            shape=(cfg.bN, cfg.bK, cfg.num_stages),
+            stride=(cfg.bK, 1, cfg.stage_elements)
         )
         sC_layout = cute.make_layout(
-            shape = (cfg.bM, cfg.bN),
-            stride = (cfg.bN + cfg.output_pad, 1)
+            shape=(cfg.bM, cfg.bN),
+            stride=(cfg.bN + cfg.output_pad, 1)
         )
         sC_tma_layout = cute.make_layout(
-            shape = (cfg.bM, cfg.bN + cfg.output_pad),
-            stride = (cfg.bN + cfg.output_pad, 1)
+            shape=(cfg.bM, cfg.bN + cfg.output_pad),
+            stride=(cfg.bN + cfg.output_pad, 1)
         )
 
         stages_ptr = storage.stages.data_ptr()
@@ -160,7 +160,7 @@ class Matmul:
         tCrA = thr_mma.make_fragment_A(thr_mma.partition_A(sA[None, None, 0]))
         tCrB = thr_mma.make_fragment_B(thr_mma.partition_B(sB[None, None, 0]))
 
-        acc_shape = thr_mma.partition_shape_C((cfg.bM, cfg.bN))
+        acc_shape=thr_mma.partition_shape_C((cfg.bM, cfg.bN))
         tCrC = cute.make_rmem_tensor(acc_shape, Float32)
         tCrC.fill(0.0)
 

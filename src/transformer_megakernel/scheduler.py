@@ -19,8 +19,8 @@ class OpScheduler:
         self.M = self.bs * self.q_len
 
         self.E = input_config.embed_dim
-        self.num_q_heads = input_config.num_q_heads
-        self.num_kv_heads = input_config.num_kv_heads
+        self.num_q_heads= input_config.num_q_heads
+        self.num_kv_heads= input_config.num_kv_heads
         self.head_dim = input_config.embed_dim // input_config.num_q_heads
         self.Qd = (input_config.num_q_heads + 2 * input_config.num_kv_heads) * self.head_dim
         self.F = input_config.ff_dim

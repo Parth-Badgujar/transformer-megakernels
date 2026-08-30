@@ -54,11 +54,11 @@ class Attention:
         warpN = 4 // warpM
         tiled_mma_qk = cute.make_tiled_mma(
             warp.MmaF16BF16Op(BFloat16, Float32, (16, 8, 16)),
-            (warpM, warpN, 1), permutation_mnk = (cfg.bQ, cfg.bKV, cfg.head_dim),
+            (warpM, warpN, 1), permutation_mnk=(cfg.bQ, cfg.bKV, cfg.head_dim),
         )
         tiled_mma_pv = cute.make_tiled_mma(
             warp.MmaF16BF16Op(BFloat16, Float32, (16, 8, 16)),
-            (warpM, 1, warpN), permutation_mnk = (cfg.bQ, cfg.head_dim, cfg.bKV),
+            (warpM, 1, warpN), permutation_mnk=(cfg.bQ, cfg.head_dim, cfg.bKV),
         )
         return tiled_mma_qk, tiled_mma_pv
 
@@ -67,7 +67,7 @@ class Attention:
         atom_async = cute.make_copy_atom(
             cpasync.CopyG2SOp(cache_mode = cute.nvgpu.LoadCacheMode.GLOBAL),
             cutlass.BFloat16,
-            num_bits_per_copy = 128
+            num_bits_per_copy=128
         )
         async_elems     = 128 // 16
         cols_per_pass   = self.config.head_dim // async_elems
@@ -79,8 +79,8 @@ class Attention:
 
     @cute.jit
     def get_smem_rmem_copy_atom(self) -> tuple[cute.TiledCopy, cute.TiledCopy]:
-        ldmatrix   = warp.LdMatrix8x8x16bOp(transpose = False, num_matrices = 4)
-        ldmatrix_t = warp.LdMatrix8x8x16bOp(transpose = True,  num_matrices = 4)
+        ldmatrix   = warp.LdMatrix8x8x16bOp(transpose=False, num_matrices=4)
+        ldmatrix_t = warp.LdMatrix8x8x16bOp(transpose=True,  num_matrices=4)
         smem_atom_QK = cute.make_copy_atom(ldmatrix,   BFloat16)
         smem_atom_V  = cute.make_copy_atom(ldmatrix_t, BFloat16)
         return smem_atom_QK, smem_atom_V
@@ -90,7 +90,7 @@ class Attention:
     def _reshape_acc_to_mn(acc):
         col_major = cute.make_layout(acc.layout.shape)
         mn_layout = cute.make_layout(
-            shape = (
+            shape=(
                 (col_major.shape[0][1], col_major.shape[1]),
                 (col_major.shape[0][0], col_major.shape[2])
             ),
@@ -119,7 +119,7 @@ class Attention:
 
     @cute.jit
     def _warpgroup_sync(self, *, group_id):
-        cute.arch.barrier(barrier_id = 12 + group_id, number_of_threads = 128)
+        cute.arch.barrier(barrier_id=12 + group_id, number_of_threads=128)
 
     @cute.jit
     def load_Q(self, thread_Q_gmem, thread_Q_shared, gmem_tiled_copy):
@@ -178,9 +178,9 @@ class Attention:
             safe_max    = block_max if block_max != -Float32.inf else 0.0
 
             probs       = cute.math.exp2(
-                (scores - safe_max) * softmax_scale_log2, fastmath = True)
+                (scores - safe_max) * softmax_scale_log2, fastmath=True)
             rescale     = cute.math.exp2(
-                (prev_max - safe_max) * softmax_scale_log2, fastmath = True)
+                (prev_max - safe_max) * softmax_scale_log2, fastmath=True)
 
             output_mn[r, None].store(output_mn[r, None].load() * rescale)
             row_sum[r]  = probs.reduce(cute.ReductionOp.ADD, row_sum[r] * rescale, 0)
@@ -228,19 +228,19 @@ class Attention:
         layout_atom  = cute.make_composed_layout(
             cute.make_swizzle(3, 3, 3),
             0,
-            cute.make_layout((8, 64), stride = (64, 1)),
+            cute.make_layout((8, 64), stride=(64, 1)),
         )
 
         sKV_layout = cute.tile_to_shape(layout_atom, (cfg.bKV, cfg.head_dim), (0, 1))
         sQ_layout  = cute.tile_to_shape(layout_atom, (cfg.bQ,  cfg.head_dim), (0, 1))
 
-        sO_layout     = cute.make_layout(
-            shape = (cfg.bQ, cfg.head_dim),
-            stride = (cfg.head_dim + cfg.output_pad, 1)
+        sO_layout = cute.make_layout(
+            shape=(cfg.bQ, cfg.head_dim),
+            stride=(cfg.head_dim + cfg.output_pad, 1)
         )
         sO_tma_layout = cute.make_layout(
-            shape = (cfg.bQ, cfg.head_dim + cfg.output_pad),
-            stride = (cfg.head_dim + cfg.output_pad, 1)
+            shape=(cfg.bQ, cfg.head_dim + cfg.output_pad),
+            stride=(cfg.head_dim + cfg.output_pad, 1)
         )
 
         gQ  = cute.local_tile(mQ[batch_idx, q_head_idx,  None, None], (cfg.bQ,  cfg.head_dim), (query_block_idx, 0))
@@ -283,7 +283,11 @@ class Attention:
         thr_mma_pv = tiled_mma_pv.get_slice(group_tid)
         rmem_tensor_Q_S = thr_mma_qk.make_fragment_A(thr_mma_qk.partition_A(sQ))
         rmem_tensor_K_S = thr_mma_qk.make_fragment_B(thr_mma_qk.partition_B(sK))
-        rmem_tensor_V_O = thr_mma_pv.make_fragment_B(thr_mma_pv.partition_B(sVt))
+
+        sVt_nosw_layout = cute.get_nonswizzle_portion(sVt.layout)
+        sVt_nosw        = cute.make_tensor(sVt.iterator, sVt_nosw_layout)
+        rmem_tensor_V_O = thr_mma_pv.make_fragment_B(thr_mma_pv.partition_B(sVt_nosw))
+
         acc_O = thr_mma_pv.make_fragment_C(thr_mma_pv.partition_C(sO))
         acc_S = cute.make_rmem_tensor(thr_mma_qk.partition_shape_C((cfg.bQ,cfg.bKV)), Float32)
 
@@ -360,7 +364,7 @@ class Attention:
 
         warpgroup_sync()
         cute.copy(thr_cpy_Q_V, thr_cpy_Q_V.partition_S(sQ), thr_cpy_Q_V.retile(rmem_tensor_Q_S))
-
+        warpgroup_sync() #just adding this did not help
         cute.arch.mbarrier_wait(compute_bar_me, phases.compute_phase)
 
         cS_mn = Attention._reshape_acc_to_mn(
@@ -417,7 +421,7 @@ class Attention:
                 if warpgroup.group_tidx == 0:
                     range_start(mStart_probe, s_cnt, cute.arch.block_idx()[0], TAGS["LOAD_V"], warpgroup.group_id)
                     s_cnt += 1
-
+            warpgroup_sync() 
             load_V(n)
 
             cute.arch.cp_async_wait_group(1)       # K_n has landed; V_n still in flight
@@ -440,7 +444,7 @@ class Attention:
                     st_cnt += 1
                     range_start(mStart_probe, s_cnt, cute.arch.block_idx()[0], TAGS["LOAD_K"], warpgroup.group_id)
                     s_cnt += 1
-
+            warpgroup_sync() 
             load_K(n + 1)      # prefetch next K
 
             if cutlass.const_expr(self.profile):
@@ -463,7 +467,6 @@ class Attention:
                     st_cnt += 1
                     range_start(mStart_probe, s_cnt, cute.arch.block_idx()[0], TAGS["COMPUTE_PV"], warpgroup.group_id)
                     s_cnt += 1
-            #                     cute.arch.block_idx()[0], TAGS["COMPUTE_PV"])
             gemm_PV()
 
             if cutlass.const_expr(self.profile):
@@ -478,6 +481,7 @@ class Attention:
                 s_cnt += 1
 
         acc_S.fill(0.0)
+        warpgroup_sync() 
         load_V(last)
         cute.arch.cp_async_wait_group(1)
 

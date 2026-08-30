@@ -31,7 +31,6 @@ from cutlass import Int32, BFloat16, Uint64
 # Required probe tensor column count: PROBE_HEADER + MAX_TAG_SLOTS * PROBE_ENTRY
 PROBE_COLS = PROBE_HEADER + MAX_TAG_SLOTS * PROBE_ENTRY  # = 1 + 16*4 = 65
 
-
 logger = logging.getLogger(__name__)
 
 class Megakernel:
@@ -46,7 +45,7 @@ class Megakernel:
         self.kv_len       = ic.kv_len
         self.q_len        = ic.q_len
         self.num_q_heads  = ic.num_q_heads
-        self.num_kv_heads = ic.num_kv_heads
+        self.num_kv_heads= ic.num_kv_heads
         self.ff_dim       = ic.ff_dim
         self.num_stages   = kc.num_stages
         self.bM           = kc.bM
@@ -150,11 +149,11 @@ class Megakernel:
     ):
         q_layout  = cute.make_layout(
             shape  = (self.bs, self.num_q_heads,  self.q_len, self.head_dim),
-            stride = (self.q_len * self.qkv_out_dim, self.head_dim, self.qkv_out_dim, 1),
+            stride=(self.q_len * self.qkv_out_dim, self.head_dim, self.qkv_out_dim, 1),
         )
         kv_layout = cute.make_layout(
             shape  = (self.bs, self.num_kv_heads, self.kv_len, self.head_dim),
-            stride = (self.kv_len * self.qkv_out_dim, self.head_dim, self.qkv_out_dim, 1),
+            stride=(self.kv_len * self.qkv_out_dim, self.head_dim, self.qkv_out_dim, 1),
         )
 
         k_off = self.num_q_heads * self.head_dim
@@ -167,64 +166,64 @@ class Megakernel:
 
         mAttn_out = cute.make_tensor(
             mWorkspace1.iterator, cute.make_ordered_layout(
-                shape = (self.bs, self.num_q_heads, self.q_len, self.head_dim),
-                order = (3, 1, 2, 0),
+                shape=(self.bs, self.num_q_heads, self.q_len, self.head_dim),
+                order=(3, 1, 2, 0),
             )
         )
         mQKV_act = cute.make_tensor(
             mWorkspace2.iterator, cute.make_ordered_layout(
-                shape = (self.num_tokens, self.qkv_out_dim // self.bN, self.bN),
-                order = (2, 1, 0),
+                shape=(self.num_tokens, self.qkv_out_dim // self.bN, self.bN),
+                order=(2, 1, 0),
             )
         )
         mFF_hidden = cute.make_tensor(
             mWorkspace2.iterator,
-            cute.make_ordered_layout(shape = (self.num_tokens, self.ff_dim), order = (1, 0)),
+            cute.make_ordered_layout(shape=(self.num_tokens, self.ff_dim), order=(1, 0)),
         )
         mFF_hidden_mm = cute.make_tensor(
             mWorkspace2.iterator, cute.make_ordered_layout(
-                shape = (self.num_tokens, self.ff_dim // self.bN, self.bN),
-                order = (2, 1, 0),
+                shape=(self.num_tokens, self.ff_dim // self.bN, self.bN),
+                order=(2, 1, 0),
             )
         )
 
         mEmbed_st = cute.make_tensor(
             mEmbedding.iterator, cute.make_ordered_layout(
-                shape = (self.num_tokens, self.embed_dim // self.bN, self.bN),
-                order = (2, 1, 0),
+                shape=(self.num_tokens, self.embed_dim // self.bN, self.bN),
+                order=(2, 1, 0),
             )
         )
         mWS1_embed = cute.make_tensor(
             mWorkspace1.iterator,
-            cute.make_ordered_layout(shape = (self.num_tokens, self.embed_dim), order = (1, 0)),
+            cute.make_ordered_layout(shape=(self.num_tokens, self.embed_dim), order=(1, 0)),
         )
 
         matmul_A_sw = cute.make_composed_layout(
             cute.make_swizzle(int(math.log2(self.bK)) - 3, 4, 3), 0,
             cute.make_ordered_layout(
-                shape = (self.bM, self.bK),
-                order = (1, 0)
+                shape=(self.bM, self.bK),
+                order=(1, 0)
             ),
         )
         matmul_B_sw = cute.make_composed_layout(
             cute.make_swizzle(int(math.log2(self.bK)) - 3, 4, 3), 0,
             cute.make_ordered_layout(
-                shape = (1, self.bN, self.bK),
-                order = (2, 1, 0)
+                shape=(1, self.bN, self.bK),
+                order=(2, 1, 0)
             ),
         )
         matmul_C_pad = cute.make_ordered_layout(
-            shape = (self.bM, 1, self.bN + self.output_pad), order = (2, 1, 0),
+            shape=(self.bM, 1, self.bN + self.output_pad), order=(2, 1, 0),
         )
 
         # RMS activations are tiled by num_sets rows (V2: bR replaced by num_sets)
         embed_act = cute.make_ordered_layout(
-            shape = (self.num_sets, self.embed_dim),
-            order = (1, 0),
+            shape=(self.num_sets, self.embed_dim),
+            order=(1, 0),
         )
         attn_out = cute.make_ordered_layout(
-            shape = (1, 1, self.bQ, self.head_dim + self.output_pad),
-            order = (3, 2, 1, 0),
+            shape=(1, 1, self.bQ, self.head_dim + self.output_pad),
+            order=(3, 2, 1, 0),
         )
 
         '''
@@ -269,13 +268,13 @@ class Megakernel:
         tma_DOWN_out, g_DOWN_out = cpasync.make_tiled_tma_atom(store_op_red, mEmbed_st,  matmul_C_pad, (self.bM, 1, self.bN + self.output_pad))
         g_DOWN_out_nt = mEmbedding
 
-        self.rmsnorm = RMSNorm(self.rms_config,  profile=self.profile)
-        self.qkv     = Matmul(self.matmul_config, basic_store,          profile=self.profile)
-        self.out     = Matmul(self.matmul_config, residual_add_store,   profile=self.profile)
-        self.up      = Matmul(self.matmul_config, basic_store,          profile=self.profile)
-        self.gate    = Matmul(self.matmul_config, silu_mul,             profile=self.profile)
-        self.down    = Matmul(self.matmul_config, residual_add_store,   profile=self.profile)
-        self.attn    = Attention(self.attention_config,                 profile=self.profile)
+        self.rmsnorm = RMSNorm(self.rms_config, profile=self.profile)
+        self.qkv     = Matmul(self.matmul_config, basic_store, profile=self.profile)
+        self.out     = Matmul(self.matmul_config, residual_add_store, profile=self.profile)
+        self.up      = Matmul(self.matmul_config, basic_store, profile=self.profile)
+        self.gate    = Matmul(self.matmul_config, silu_mul, profile=self.profile)
+        self.down    = Matmul(self.matmul_config, residual_add_store, profile=self.profile)
+        self.attn    = Attention(self.attention_config, profile=self.profile)
 
         SharedStorage = self._get_shared_storage()
 
@@ -396,9 +395,9 @@ class Megakernel:
             cute.arch.mbarrier_arrive(output_barriers + 0)
 
         phases = Phases(
-            compute_phase = 0,
-            input_phase = 0,
-            output_phase = 0
+            compute_phase=0,
+            input_phase=0,
+            output_phase=0
         )
         s_cnt = 0
         st_cnt = 0
@@ -511,23 +510,23 @@ class TransformerMegakernel:
         # 3. Create DLPack views
         self.cSchedule = from_dlpack(self.mSchedule)
         self.cAtomics  = from_dlpack(self.mAtomics)
-        self.cRms_w    = from_dlpack(rms_w,  assumed_align = 16)
-        self.cQkv_w    = from_dlpack(qkv_w,  assumed_align = 16)
-        self.cGate_w   = from_dlpack(gate_w, assumed_align = 16)
-        self.cUp_w     = from_dlpack(up_w,   assumed_align = 16)
-        self.cDown_w   = from_dlpack(down_w, assumed_align = 16)
-        self.cOut_w    = from_dlpack(out_w,  assumed_align = 16)
+        self.cRms_w    = from_dlpack(rms_w,  assumed_align=16)
+        self.cQkv_w    = from_dlpack(qkv_w,  assumed_align=16)
+        self.cGate_w   = from_dlpack(gate_w, assumed_align=16)
+        self.cUp_w     = from_dlpack(up_w,   assumed_align=16)
+        self.cDown_w   = from_dlpack(down_w, assumed_align=16)
+        self.cOut_w    = from_dlpack(out_w,  assumed_align=16)
 
         # 4. Allocate workspaces
         self.num_tokens = input_config.bs * input_config.q_len
         self.qkv_dim    = (input_config.num_q_heads + 2 * input_config.num_kv_heads) * (input_config.embed_dim // input_config.num_q_heads)
         self.ws2_dim    = max(self.qkv_dim, input_config.ff_dim)
 
-        self.ws1 = torch.zeros((self.num_tokens, input_config.embed_dim), dtype = torch.bfloat16, device="cuda")
-        self.ws2 = torch.zeros((self.num_tokens, self.ws2_dim), dtype = torch.bfloat16, device="cuda")
+        self.ws1 = torch.zeros((self.num_tokens, input_config.embed_dim), dtype=torch.bfloat16, device="cuda")
+        self.ws2 = torch.zeros((self.num_tokens, self.ws2_dim), dtype=torch.bfloat16, device="cuda")
         logger.info(f"Allocated workspace 1: {self.ws1.shape}, workspace 2: {self.ws2.shape}")
-        self.cWs1 = from_dlpack(self.ws1, assumed_align = 16)
-        self.cWs2 = from_dlpack(self.ws2, assumed_align = 16)
+        self.cWs1 = from_dlpack(self.ws1, assumed_align=16)
+        self.cWs2 = from_dlpack(self.ws2, assumed_align=16)
 
         # 5. Allocate probe tensor (only when profile=True)
         if self.profile:
@@ -544,22 +543,22 @@ class TransformerMegakernel:
                 (num_probe_rows, self.num_sms, 2, 2), dtype=torch.int64, device="cuda"
             )
         else:
-            self.mProbe = torch.zeros((1,), dtype = torch.int64, device = "cuda")
-            self.mStop_probe = torch.zeros((1,), dtype = torch.int64, device = "cuda")
+            self.mProbe = torch.zeros((1,), dtype=torch.int64, device="cuda")
+            self.mStop_probe = torch.zeros((1,), dtype=torch.int64, device="cuda")
             
-        self.cProbe = from_dlpack(self.mProbe, assumed_align = 16)
-        self.cStop_mProbe = from_dlpack(self.mStop_probe, assumed_align = 16)
+        self.cProbe = from_dlpack(self.mProbe, assumed_align=16)
+        self.cStop_mProbe = from_dlpack(self.mStop_probe, assumed_align=16)
 
         # Per-SM clock offset tensor: offset[sm] = globaltimer - clock64 at kernel start
-        self.mClockOffsets = torch.zeros((self.num_sms,), dtype = torch.int64, device="cuda")
-        self.cClockOffsets = from_dlpack(self.mClockOffsets, assumed_align = 16)
+        self.mClockOffsets = torch.zeros((self.num_sms,), dtype=torch.int64, device="cuda")
+        self.cClockOffsets = from_dlpack(self.mClockOffsets, assumed_align=16)
 
         # 6. Compile the kernel
         self.kernel = Megakernel(input_config, kernel_config, profile = profile)
 
         # Dummy compilation embedding
-        dummy_emb = torch.empty((self.num_tokens, input_config.embed_dim), dtype = torch.bfloat16, device = "cuda")
-        cDummyEmb = from_dlpack(dummy_emb, assumed_align = 16)
+        dummy_emb = torch.empty((self.num_tokens, input_config.embed_dim), dtype=torch.bfloat16, device="cuda")
+        cDummyEmb = from_dlpack(dummy_emb, assumed_align=16)
 
         self.compiled_kernel = cute.compile(
             self.kernel,
@@ -577,7 +576,7 @@ class TransformerMegakernel:
             self.mStop_probe.zero_()
             self.mClockOffsets.zero_()
         output_embedding = input_embedding.clone()
-        cEmbedding = from_dlpack(output_embedding, assumed_align = 16)
+        cEmbedding = from_dlpack(output_embedding, assumed_align=16)
 
         self.compiled_kernel(
             self.cSchedule, self.cAtomics,
@@ -589,7 +588,7 @@ class TransformerMegakernel:
         if self.profile:
             torch.cuda.synchronize()
             dump_probe(self.mProbe, self.mStop_probe, self.num_sms,
-                       max_events = 30000, out_path = trace_path,
+                       max_events=30000, out_path=trace_path,
                        clock_offsets=self.mClockOffsets)
 
         return output_embedding
