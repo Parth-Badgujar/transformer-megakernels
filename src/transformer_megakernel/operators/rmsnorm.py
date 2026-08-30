@@ -49,7 +49,7 @@ class RMSNorm:
         num_sets = (4 // cfg.warps_per_row)
         return cute.make_layout(
             shape=((lanes_per_row, num_sets), (alligment, num_per_thread // alligment)),
-            stride=((num_sets * alligment, 1), (num_sets, alligment * num_per_thread * num_sets))
+            stride=((num_sets * alligment, 1), (num_sets, lanes_per_row * alligment * num_sets))
         )
 
     @cute.jit
