@@ -12,7 +12,7 @@ input_config:
 kernel_config:
   use_tma_reduce: true
   output_pad: 8
-  warps_per_row: 1
+  warps_per_row: 2
   rows_per_rms_block: 8
   max_works: 0
   block_q: 64

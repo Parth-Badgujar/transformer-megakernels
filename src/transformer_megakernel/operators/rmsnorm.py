@@ -29,6 +29,8 @@ class RMSNormConfig:
         assert 4 % self.warps_per_row == 0, "Warps per row should divide 4 (max 4 warps per row)"
         assert (self.bRMS % (4 // self.warps_per_row)) == 0, "bM should be divisible by (4 // warps_per_row)"
         assert self.embed_dim % (32 * self.warps_per_row) == 0, "Embed dim should be divisible by (32 * warps_per_row)"
+        assert (self.embed_dim // (32 * self.warps_per_row)) % 8 == 0, "embed_dim // (32 * warps_per_row) must be a multiple of 8"
+        assert (self.bRMS // (4 // self.warps_per_row)) >= 2, "bRMS // num_sets must be >= 2 for the 2-stage RMS pipeline"
 
 
 logger = logging.getLogger(__name__)
