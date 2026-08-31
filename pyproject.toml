@@ -1,0 +1,39 @@
+[project]
+name = "transformer-megakernel"
+version = "0.1.0"
+description = "Megakernel for transformer in CuTe/CUTLASS DSL"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "matplotlib>=3.10.9",
+    "modal>=1.4.3",
+    "nvidia-cutlass-dsl[cu13]>=4.5.2",
+    "omegaconf",
+    "torch>=2.11.0",
+    "tqdm",
+]
+
+[project.optional-dependencies]
+benchmark = [
+    "torch-tensorrt>=2.12.1",
+]
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+[tool.uv.sources]
+torch = [
+  { index = "pytorch-cu130", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+]
+torchvision = [
+  { index = "pytorch-cu130", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+]

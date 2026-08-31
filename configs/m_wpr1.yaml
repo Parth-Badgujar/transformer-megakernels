@@ -1,0 +1,23 @@
+input_config:
+  bs: 8
+  embed_dim: 3072
+  kv_len: 256
+  q_len: 256
+  num_q_heads: 24
+  num_kv_heads: 8
+  num_layers: 1
+  is_causal: true
+  ff_dim: 4096
+
+kernel_config:
+  use_tma_reduce: true
+  output_pad: 8
+  warps_per_row: 2
+  rows_per_rms_block: 8
+  max_works: 0
+  block_q: 64
+  block_kv: 64
+  num_stages: 2
+  bM: 128
+  bN: 128
+  bK: 64

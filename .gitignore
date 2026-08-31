@@ -1,0 +1,28 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+*.aux
+*.log
+*.pdf
+*.tex
+# Virtual environments
+.venv
+*.pt
+*.ptx
+*.cubin
+*.ncu-rep
+*.cu
+*.ipynb
+*.clangd
+*.clang-format
+*.txt
+*.png
+*.npy
+cutlass/
+analysis/
+*.json
+output/
