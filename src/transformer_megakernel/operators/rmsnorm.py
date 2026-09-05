@@ -18,6 +18,11 @@ def prev_power_of_2(num):
     return 2 ** math.floor(math.log2(num))
 
 
+def _copy_alignment(embed_dim, warps_per_row):
+    num_per_thread = embed_dim // (32 * warps_per_row)
+    return num_per_thread & (~(num_per_thread - 1))
+
+
 @dataclass
 class RMSNormConfig:
     embed_dim: int
@@ -29,7 +34,6 @@ class RMSNormConfig:
         assert 4 % self.warps_per_row == 0, "Warps per row should divide 4 (max 4 warps per row)"
         assert (self.bRMS % (4 // self.warps_per_row)) == 0, "bM should be divisible by (4 // warps_per_row)"
         assert self.embed_dim % (32 * self.warps_per_row) == 0, "Embed dim should be divisible by (32 * warps_per_row)"
-        assert (self.embed_dim // (32 * self.warps_per_row)) % 8 == 0, "embed_dim // (32 * warps_per_row) must be a multiple of 8"
         assert (self.bRMS // (4 // self.warps_per_row)) >= 2, "bRMS // num_sets must be >= 2 for the 2-stage RMS pipeline"
 
 
@@ -47,7 +51,7 @@ class RMSNorm:
         cfg = self.config
         lanes_per_row = 32 * cfg.warps_per_row
         num_per_thread = cfg.embed_dim // lanes_per_row
-        alligment = num_per_thread & (~(num_per_thread - 1))
+        alligment = _copy_alignment(cfg.embed_dim, cfg.warps_per_row)
         num_sets = (4 // cfg.warps_per_row)
         return cute.make_layout(
             shape=((lanes_per_row, num_sets), (alligment, num_per_thread // alligment)),
@@ -193,8 +197,9 @@ class RMSNorm:
         tEsX, tEgE = cpasync.tma_partition(tma_inp, 0, cute.make_layout(1), sX_g, gE_g)
         tOsO, tOgO = cpasync.tma_partition(tma_out, 0, cute.make_layout(1), sO_g, gO_g)
 
+        copy_width = min(_copy_alignment(cfg.embed_dim, cfg.warps_per_row), 8)
         atom = cute.make_copy_atom(
-            cute.nvgpu.CopyUniversalOp(), BFloat16, num_bits_per_copy=128
+            cute.nvgpu.CopyUniversalOp(), BFloat16, num_bits_per_copy=copy_width * 16
         )
 
         if cutlass.const_expr(self.profile):
